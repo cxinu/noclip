@@ -1,6 +1,5 @@
 package main
 
-import "core:fmt"
 import "core:math"
 import rl "vendor:raylib"
 
@@ -32,8 +31,6 @@ Biome_Type :: enum {
 	Arcade_Night,
 	Sub_Basement,
 }
-NUM_BIOMES :: 10
-
 WORLD_SEED: u32 = 1337
 
 NUM_LEVELS :: 24
@@ -399,17 +396,34 @@ region_at :: proc(x, z: i32) -> ^Region {
 	return r
 }
 
-regions_trim :: proc() {
-	if len(regions) < 200 do return
-	for _, r in regions {
-		delete(r.edge_w)
-		delete(r.edge_n)
-		delete(r.cell_flg)
-		delete(r.cell_floor)
-		delete(r.cell_stair)
-		free(r)
+// Keep only regions near the player on the active level. The world is
+// deterministic, so evicted regions can be regenerated without state loss.
+// This bounds memory use during long exploratory sessions.
+regions_trim :: proc(cell_x, cell_z: i32, radius: i32 = 2) {
+	center_i := reg_col_of(cell_x)
+	center_j := reg_row_of(center_i, cell_z)
+	stale := make([dynamic][3]i32, context.temp_allocator)
+
+	for key in regions {
+		nearby := key[0] == current_level &&
+			abs(key[1] - center_i) <= radius &&
+			abs(key[2] - center_j) <= radius
+		if !nearby do append(&stale, key)
 	}
-	clear(&regions)
+
+	for key in stale {
+		if r, ok := regions[key]; ok {
+			delete(r.edge_w)
+			delete(r.edge_n)
+			delete(r.cell_flg)
+			delete(r.cell_floor)
+			delete(r.cell_stair)
+			free(r)
+			delete_key(&regions, key)
+		}
+	}
+
+	// The one-entry fast path may otherwise point at an evicted region.
 	last_region = nil
 }
 
@@ -811,11 +825,3 @@ light_color :: proc(x, z: i32) -> rl.Color {
 	return rl.Color{255, 245, 220, 255}
 }
 
-biome_debug_stats :: proc() {
-	counts: [Biome_Type]int
-	total := 0
-	for z := i32(-400); z < 400; z += 4 do for x := i32(-400); x < 400; x += 4 {
-		counts[biome_at(x, z)] += 1; total += 1
-	}
-	for b in Biome_Type do fmt.printf("%v: %.1f%%\n", b, f32(counts[b]) * 100 / f32(total))
-}

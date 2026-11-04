@@ -121,12 +121,10 @@ player_update :: proc(p: ^Player, dt: f32) {
 
 	if p.feet_y <= ground {
 		if !was_grounded && p.vel_y < -2 {
-			impact := clamp(-p.vel_y, 0, 18) / 18
 			drop := max(old_pos.y - ground, 0)
 			scale := 0.05 + 0.10 * clamp(drop / (FLOOR_STEP * 2), 0, 1)
 			p.kick_v[0] += p.vel_y * scale
 			p.kick_v[1] += p.vel_y * scale * 0.6
-			_ = impact
 		}
 		p.feet_y, p.vel_y, p.grounded = ground, 0, true
 	} else if p.grounded && p.feet_y - ground <= STEP_DOWN_SNAP {

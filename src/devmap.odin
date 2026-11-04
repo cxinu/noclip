@@ -355,5 +355,8 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		)
 	}
 
+	// While inspecting the map, retain regions around the map viewport rather
+	// than the player's (possibly distant) position.
+	regions_trim(i32(math.floor(m.cx)), i32(math.floor(m.cz)))
 	rl.EndDrawing()
 }

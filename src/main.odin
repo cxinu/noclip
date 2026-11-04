@@ -1,5 +1,6 @@
 package main
 
+import "core:math"
 import rl "vendor:raylib"
 
 clear_world_chunks :: proc(w: ^World) {
@@ -31,9 +32,13 @@ main :: proc() {
 			clear_world_chunks(&w)
 			level_dirty = false
 		}
-		world_update(&w, p.cam.position)
-		if d.open do devmap_draw(&d, p.cam.position, p.yaw)
-		else {
+		if d.open {
+			devmap_draw(&d, p.cam.position, p.yaw)
+		} else {
+			world_update(&w, p.cam.position)
+			cell_x := i32(math.floor(p.cam.position.x / CELL))
+			cell_z := i32(math.floor(p.cam.position.z / CELL))
+			regions_trim(cell_x, cell_z)
 			scene_draw(&r, &w, p.cam)
 			renderer_present(&r, p.fade)
 		}

@@ -141,20 +141,30 @@ world_update :: proc(w: ^World, pos: rl.Vector3) {
 	pc := Chunk_Coord{i32(math.floor(pos.x / CHUNK_W)), i32(math.floor(pos.z / CHUNK_W))}
 	if pc not_in w.chunks do w.chunks[pc] = build_chunk(pc)
 
-	built := false
+	// Build the closest missing neighbour first. The old nested-loop order
+	// could spend a frame generating a farther diagonal chunk while a nearer
+	// chunk was still missing.
+	best_chunk: Chunk_Coord
+	best_distance: i32 = 0x7fffffff
+	has_missing := false
 	for dz in -VIEW_RADIUS ..= VIEW_RADIUS do for dx in -VIEW_RADIUS ..= VIEW_RADIUS {
-		if built do continue
 		c := pc + {i32(dx), i32(dz)}
 		if c in w.chunks do continue
-		w.chunks[c] = build_chunk(c)
-		built = true
+		distance := i32(dx * dx + dz * dz)
+		if !has_missing || distance < best_distance {
+			best_chunk = c
+			best_distance = distance
+			has_missing = true
+		}
 	}
+	if has_missing do w.chunks[best_chunk] = build_chunk(best_chunk)
 
 	stale := make([dynamic]Chunk_Coord, context.temp_allocator)
 	for c in w.chunks {
 		if abs(c.x - pc.x) > VIEW_RADIUS + 1 || abs(c.y - pc.y) > VIEW_RADIUS + 1 do append(&stale, c)
 	}
 	for c in stale {rl.UnloadMesh(w.chunks[c]); delete_key(&w.chunks, c)}
+
 }
 
 world_draw :: proc(w: ^World) {
@@ -238,11 +248,6 @@ linalg_len :: proc(p: [3]f32) -> f32 {return math.sqrt(p.x * p.x + p.y * p.y + p
 
 flat_lit :: proc(v: ^Verts, a, b, c, d: [3]f32, col: rl.Color) {
 	lit_quad(v, a, b, c, d, col, 1.0, FLAT_STEP, {true, true})
-}
-
-Wall_Box_Def :: struct {
-	lo, hi: [2]f32,
-	y0:     f32,
 }
 
 emit_wall :: proc(

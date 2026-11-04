@@ -25,9 +25,6 @@ SHADER_OBJ_FS :: "assets/shaders/ps1_obj.fs"
 SHADER_POST_FS :: "assets/shaders/ps1_post.fs"
 SHADER_BLOOM_FS :: "assets/shaders/bloom.fs"
 
-// ---- world bounds ----
-PLAY_HALF :: 150.0
-
 // ---- player ----
 EYE_H :: 1.3
 PLAYER_R :: 0.5
