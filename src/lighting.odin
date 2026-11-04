@@ -16,8 +16,8 @@ LIGHT_GRID_N :: CHUNK_SIZE + 2 * LIGHT_PAD
 LIGHT_RADIUS :: 10.0 // world units; light dies well before it reaches distant walls
 LIGHT_CULL_R :: i32(3) // cells searched around a vertex
 
-AMBIENT :: 0.0 // no light => pure black; no muddy base glow
-LIGHT_GAIN :: 2.4
+AMBIENT :: 0.08 // small base glow for better visibility
+LIGHT_GAIN :: 2.6
 
 CEIL_SLACK :: 0.35 // ignore tiny interpolation differences at ceiling corners
 
@@ -63,7 +63,13 @@ light_grid_fill :: proc(c: Chunk_Coord) {
 			// instead of being blocked or leaking through it.
 			g.wall_w[j][i] = has_wall(wx, wz, false) ? west_wall_height(wx, wz) : 0
 			g.wall_n[j][i] = has_wall(wx, wz, true) ? north_wall_height(wx, wz) : 0
-			g.ceil[j][i] = ceil_h(wx, wz)
+			// Use the highest ceiling corner in the cell, not the flat cell
+			// height: ceilings are built from corner heights, so this avoids
+			// false "ceiling shadows" where the mesh slopes upward.
+			g.ceil[j][i] = max(
+				max(corner_h(wx, wz), corner_h(wx + 1, wz)),
+				max(corner_h(wx, wz + 1), corner_h(wx + 1, wz + 1)),
+			)
 		}
 	}
 }
@@ -166,8 +172,13 @@ light_blocked :: proc(ax, ay, az, bx, by, bz: f32) -> bool {
 light_center: [2]f32
 
 // fraction of a light panel visible from (sx, sy, sz): 4 samples, refined to 9
-// on the penumbra so wall edges get a soft gradient instead of a hard cutoff
+// on the penumbra so wall edges get a soft gradient instead of a hard cutoff.
 light_visibility :: proc(sx, sy, sz, lx, ly, lz: f32) -> f32 {
+	// If the center of the lamp is hidden, the surface is fully in shadow.
+	// Without this guard the panel corners can peek around a wall corner and
+	// bleed a little light onto surfaces in the next room.
+	if light_blocked(sx, sy, sz, lx, ly, lz) do return 0
+
 	so :: CELL * 0.2
 	vis: f32
 	for o in ([4][2]f32{{-so, -so}, {so, -so}, {so, so}, {-so, so}}) {
@@ -190,20 +201,22 @@ compute_vertex_lighting :: proc(
 	pos: [3]f32,
 	base_col: rl.Color,
 	k: f32 = 1.0,
-	inset := false,
+	inset: [2]bool = {},
+	shift: [2]f32 = {},
 ) -> rl.Color {
 	g := &light_grid
-	cx := i32(math.floor(pos.x / CELL))
-	cz := i32(math.floor(pos.z / CELL))
 
 	// Vertices on a cell boundary would otherwise start the shadow ray inside the
 	// neighbouring cell and be blocked by their own room's wall. Pull the sample
-	// point a hair toward the owning cell's center.
-	sx, sz := pos.x, pos.z
-	if inset {
-		sx += (light_center.x - pos.x) * 0.03
-		sz += (light_center.y - pos.z) * 0.03
-	}
+	// point a hair toward the owning cell's center. `shift` overrides the side for
+	// geometry (wall end caps) that belongs to a specific neighbouring cell.
+	sx, sz := pos.x + shift.x, pos.z + shift.y
+	if inset[0] do sx += (light_center.x - pos.x) * 0.03
+	if inset[1] do sz += (light_center.y - pos.z) * 0.03
+
+	// Search lights around the corrected sample cell, not the raw boundary cell.
+	cx := i32(math.floor(sx / CELL))
+	cz := i32(math.floor(sz / CELL))
 
 	sum_r, sum_g, sum_b: f32
 

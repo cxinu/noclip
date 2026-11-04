@@ -4,18 +4,18 @@ import "core:fmt"
 import "core:math"
 import rl "vendor:raylib"
 
-TEX_W :: 384 // biome texture size in cells; big enough for 1920 wide at zoom 6
+TEX_W :: 384
 TEX_H :: 224
-
 HUD_W :: 310
-HUD_H :: 330
+HUD_H :: 380 // grew for stair/hole info
 
 Dev_Map :: struct {
-	open:   bool,
-	zoom:   f32, // pixels per cell
-	cx, cz: f32, // view centre, in cells
-	tex:    rl.Texture2D,
-	pixels: []rl.Color,
+	open:       bool,
+	zoom:       f32,
+	cx, cz:     f32,
+	view_level: i32,
+	tex:        rl.Texture2D,
+	pixels:     []rl.Color,
 }
 
 MAP_COLORS := [Biome_Type]rl.Color {
@@ -31,7 +31,6 @@ MAP_COLORS := [Biome_Type]rl.Color {
 	.Sub_Basement      = {102, 94, 81, 255},
 }
 
-// call after the window is created (it makes a GPU texture)
 devmap_init :: proc() -> Dev_Map {
 	m := Dev_Map {
 		zoom = 12,
@@ -44,15 +43,9 @@ devmap_init :: proc() -> Dev_Map {
 	return m
 }
 
-devmap_destroy :: proc(m: ^Dev_Map) {
-	rl.UnloadTexture(m.tex)
-	delete(m.pixels)
-}
+devmap_destroy :: proc(m: ^Dev_Map) {rl.UnloadTexture(m.tex); delete(m.pixels)}
 
-// round a cell-edge position to a whole pixel so neighbouring cells tile with no seams
-snap :: proc(o, s: f32, c: i32) -> i32 {
-	return i32(math.round(o + f32(c) * s))
-}
+snap :: proc(o, s: f32, c: i32) -> i32 {return i32(math.round(o + f32(c) * s))}
 
 devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 	if rl.IsKeyPressed(.F5) {
@@ -60,22 +53,27 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		if m.open {
 			rl.EnableCursor()
 			m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL
-		} else {
-			rl.DisableCursor()
-		}
+			m.view_level = current_level
+		} else {rl.DisableCursor()}
 	}
 	if !m.open do return
 
 	m.zoom = clamp(m.zoom * (1 + rl.GetMouseWheelMove() * 0.1), 4, 40)
-
 	if rl.IsMouseButtonDown(.RIGHT) {
 		d := rl.GetMouseDelta()
 		m.cx -= d.x / m.zoom
 		m.cz -= d.y / m.zoom
 	}
-	if rl.IsKeyPressed(.C) {
-		m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL
+	if rl.IsKeyPressed(
+		.C,
+	) {m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL}
+	if rl.IsKeyPressed(.RIGHT_BRACKET) || rl.IsKeyPressed(.PAGE_UP) {
+		m.view_level = (m.view_level + 1) %% NUM_LEVELS
 	}
+	if rl.IsKeyPressed(.LEFT_BRACKET) || rl.IsKeyPressed(.PAGE_DOWN) {
+		m.view_level = (m.view_level - 1) %% NUM_LEVELS
+	}
+	if rl.IsKeyPressed(.ENTER) {set_level(m.view_level)}
 
 	mp := rl.GetMousePosition()
 	over_hud := mp.x < HUD_W && mp.y < HUD_H
@@ -83,35 +81,30 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		sw, sh := f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())
 		wx := (mp.x - (sw / 2 - m.cx * m.zoom)) / m.zoom
 		wz := (mp.y - (sh / 2 - m.cz * m.zoom)) / m.zoom
+		set_level(m.view_level)
 		player.cam.position.x = (math.floor(wx) + 0.5) * CELL
 		player.cam.position.z = (math.floor(wz) + 0.5) * CELL
 	}
 }
 
-// 0 none, 1 wall, 2 door, 3 sealed side that has a wide gap elsewhere
 edge_kind :: proc(x, z: i32, north: bool) -> int {
-	s, _ := lat_edge(x, z, north)
-	if !s.wall do return 0
-	if has_door(x, z, north) do return 2
-	if s.gap do return 3
-	return 1
-}
-
-edge_color :: proc(kind: int) -> rl.Color {
-	switch kind {
-	case 2:
-		return {100, 200, 255, 220}
-	case 3:
-		return {200, 200, 200, 120}
+	switch edge_at(x, z, north) {
+	case EDGE_WALL:
+		return 1
+	case EDGE_DOOR:
+		return 2
 	}
+	return 0
+}
+edge_color :: proc(kind: int) -> rl.Color {
+	switch kind {case 2:
+		return {100, 200, 255, 220}}
 	return {20, 20, 25, 255}
 }
-
-// one merged run of wall. a..b are pixel extents along the wall, p is the line position.
 draw_run :: proc(horizontal: bool, a, b, p, t: i32, kind: int) {
 	h := t / 2
 	col := edge_color(kind)
-	ext: i32 = kind == 1 ? h : 0 // solid walls overshoot so corners join
+	ext: i32 = kind == 1 ? h : 0
 	if horizontal {
 		rl.DrawRectangle(a - ext, p - h, (b - a) + 2 * ext + (kind == 1 ? t - 2 * h : 0), t, col)
 	} else {
@@ -119,8 +112,22 @@ draw_run :: proc(horizontal: bool, a, b, p, t: i32, kind: int) {
 	}
 }
 
-// replaces the normal frame while open
+tint_by_floor :: proc(c: rl.Color, lvl: i8) -> rl.Color {
+	if lvl == 0 do return c
+	d := i32(lvl) * 14
+	return {
+		u8(clamp(i32(c.r) + (d if lvl > 0 else 0), 0, 255)),
+		u8(clamp(i32(c.g) + (d / 2 if lvl > 0 else 0), 0, 255)),
+		u8(clamp(i32(c.b) + (d if lvl < 0 else 0), 0, 255)),
+		255,
+	}
+}
+
 devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
+	player_level := current_level
+	current_level = m.view_level
+	defer current_level = player_level
+
 	rl.BeginDrawing()
 	rl.ClearBackground({15, 15, 20, 255})
 
@@ -128,7 +135,6 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 	s := m.zoom
 	ox, oy := sw / 2 - m.cx * s, sh / 2 - m.cz * s
 
-	// below zoom 6 sample every nth cell, so far-out views stay cheap
 	step := max(i32(1), i32(math.ceil(6.0 / s)))
 	x0 := fdiv(i32(math.floor(-ox / s)), step) * step
 	z0 := fdiv(i32(math.floor(-oy / s)), step) * step
@@ -138,16 +144,15 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 	th := min(i32(TEX_H), (z1 - z0) / step + 1)
 	xe, ze := x0 + tw * step, z0 + th * step
 
-	// 1. Biome layer: one texture, one draw call
 	counts: [Biome_Type]int
 	total := 0
-	for j in 0 ..< th {
-		for i in 0 ..< tw {
-			b := biome_at(x0 + i * step, z0 + j * step)
-			counts[b] += 1
-			total += 1
-			m.pixels[int(j) * TEX_W + int(i)] = MAP_COLORS[b]
-		}
+	for j in 0 ..< th do for i in 0 ..< tw {
+		cx, cz := x0 + i * step, z0 + j * step
+		b := biome_at(cx, cz)
+		lvl := floor_level(cx, cz)
+		counts[b] += 1
+		total += 1
+		m.pixels[int(j) * TEX_W + int(i)] = tint_by_floor(MAP_COLORS[b], lvl)
 	}
 	rl.UpdateTexture(m.tex, raw_data(m.pixels))
 	dx, dy := snap(ox, s, x0), snap(oy, s, z0)
@@ -161,11 +166,43 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		rl.WHITE,
 	)
 
-	// 2. Walls, merged into runs (only when cells are big enough to read)
+	// Pillars, pools, stairs, holes
+	if s >= 6.0 {
+		for cz in z0 ..< ze do for cx in x0 ..< xe {
+			px, py := snap(ox, s, cx), snap(oy, s, cz)
+			pw := snap(ox, s, cx + 1) - px
+			ph := snap(oy, s, cz + 1) - py
+			if stair_at(cx, cz) {
+				d := stair_dir_at(cx, cz)
+				cx_c := f32(px) + f32(pw) / 2
+				cy_c := f32(py) + f32(ph) / 2
+				arx, ary: f32 = 0, 0
+				switch d {
+				case 0:
+					ary = -1
+				case 1:
+					ary = 1
+				case 2:
+					arx = 1
+				case 3:
+					arx = -1
+				}
+				rl.DrawCircleV({cx_c, cy_c}, 3, rl.YELLOW)
+				rl.DrawLineEx({cx_c, cy_c}, {cx_c + arx * f32(pw) * 0.4, cy_c + ary * f32(ph) * 0.4}, 2, rl.YELLOW)
+			} else if hole_at(cx, cz) {
+				rl.DrawRectangle(px + pw / 4, py + ph / 4, pw / 2, ph / 2, rl.BLACK)
+				rl.DrawRectangleLines(px + pw / 4, py + ph / 4, pw / 2, ph / 2, rl.Color{200, 80, 80, 255})
+			} else if pool_at(cx, cz) {
+				rl.DrawRectangle(px, py, pw, ph, {50, 160, 190, 160})
+			} else if pillar_at(cx, cz) {
+				rl.DrawRectangle(px + pw / 3, py + ph / 3, max(pw / 3, 1), max(ph / 3, 1), {20, 20, 25, 255})
+			}
+		}
+	}
+
+	// Walls
 	if s >= 6.0 {
 		t := max(i32(1), i32(math.round(s * 0.15)))
-
-		// north edges: runs along x
 		for cz in z0 ..< ze {
 			y := snap(oy, s, cz)
 			run_k, run_start := 0, x0
@@ -180,8 +217,6 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 				}
 			}
 		}
-
-		// west edges: runs along z
 		for cx in x0 ..< xe {
 			px := snap(ox, s, cx)
 			run_k, run_start := 0, z0
@@ -198,7 +233,7 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		}
 	}
 
-	// 3. Chunk borders
+	// Chunk borders
 	for cx := fdiv(x0, CHUNK_SIZE) * CHUNK_SIZE; cx <= xe; cx += CHUNK_SIZE {
 		rl.DrawRectangle(snap(ox, s, cx), 0, 1, i32(sh), {255, 255, 255, 50})
 	}
@@ -206,12 +241,13 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		rl.DrawRectangle(0, snap(oy, s, cz), i32(sw), 1, {255, 255, 255, 50})
 	}
 
-	// 4. Player + facing indicator (at the player's real position, not the view centre)
+	// Player
 	pc := rl.Vector2{ox + pos.x / CELL * s, oy + pos.z / CELL * s}
-	rl.DrawCircleV(pc, 5, rl.RED)
-	rl.DrawLineEx(pc, pc + {math.sin(yaw), math.cos(yaw)} * 18, 2, rl.RED)
+	pcol := rl.RED if player_level == m.view_level else rl.Color{160, 160, 160, 255}
+	rl.DrawCircleV(pc, 5, pcol)
+	rl.DrawLineEx(pc, pc + {math.sin(yaw), math.cos(yaw)} * 18, 2, pcol)
 
-	// 5. HUD, drawn last
+	// HUD
 	pcx, pcz := pos.x / CELL, pos.z / CELL
 	pcell := [2]i32{i32(math.floor(pcx)), i32(math.floor(pcz))}
 	rl.DrawRectangle(0, 0, HUD_W, HUD_H, {10, 10, 15, 230})
@@ -222,6 +258,7 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		10,
 		rl.WHITE,
 	)
+	rl.DrawText("[ ] PgUp/PgDn: browse floors | ENTER: go to floor", 10, 22, 10, rl.WHITE)
 	rl.DrawText(
 		fmt.ctprintf(
 			"cell %d, %d  chunk %d, %d",
@@ -231,13 +268,34 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 			fdiv(pcell.y, CHUNK_SIZE),
 		),
 		10,
-		28,
+		40,
 		10,
 		rl.WHITE,
 	)
-	rl.DrawText(fmt.ctprintf("in: %v", biome_at(pcell.x, pcell.y)), 10, 46, 10, rl.WHITE)
+	rl.DrawText(
+		fmt.ctprintf(
+			"viewing floor %d: %s%s",
+			m.view_level,
+			LEVELS[m.view_level].name,
+			" (you are here)" if player_level == m.view_level else "",
+		),
+		10,
+		56,
+		10,
+		rl.YELLOW if player_level != m.view_level else rl.WHITE,
+	)
+	if player_level != m.view_level {
+		rl.DrawText(
+			fmt.ctprintf("you are on floor %d: %s", player_level, LEVELS[player_level].name),
+			10,
+			68,
+			10,
+			{160, 160, 160, 255},
+		)
+	}
+	rl.DrawText(fmt.ctprintf("in: %v", biome_at(pcell.x, pcell.y)), 10, 80, 10, rl.WHITE)
 
-	y := i32(68)
+	y := i32(100)
 	for b in Biome_Type {
 		if total > 0 {
 			pct := f32(counts[b]) * 100 / f32(total)
@@ -247,7 +305,6 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		}
 	}
 
-	// hover info for the cell under the mouse
 	mp := rl.GetMousePosition()
 	hx := i32(math.floor((mp.x - ox) / s))
 	hz := i32(math.floor((mp.y - oy) / s))
@@ -260,6 +317,43 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		10,
 		rl.WHITE,
 	)
+	lvl := floor_level(hx, hz)
+	rl.DrawText(
+		fmt.ctprintf(
+			"floor L%d (%.2fm)%s",
+			lvl,
+			floor_h(hx, hz),
+			"  [raised]" if lvl > 0 else ("  [sunken]" if lvl < 0 else ""),
+		),
+		10,
+		y + 32,
+		10,
+		{255, 200, 120, 255} if lvl > 0 else ({120, 200, 255, 255} if lvl < 0 else rl.WHITE),
+	)
+	// NEW: transition features
+	if stair_at(hx, hz) {
+		dirs := [4]string{"N", "S", "E", "W"}
+		dir_name := dirs[stair_dir_at(hx, hz) & 3]
+		rl.DrawText(
+			fmt.ctprintf("STAIR up to L%d (dir %s)", (m.view_level + 1) %% NUM_LEVELS, dir_name),
+			10,
+			y + 48,
+			10,
+			rl.YELLOW,
+		)
+
+	} else if hole_at(hx, hz) {
+		rl.DrawText(
+			fmt.ctprintf(
+				"SHAFT down to L%d",
+				((m.view_level - 1) %% NUM_LEVELS + NUM_LEVELS) %% NUM_LEVELS,
+			),
+			10,
+			y + 48,
+			10,
+			{240, 120, 120, 255},
+		)
+	}
 
 	rl.EndDrawing()
 }

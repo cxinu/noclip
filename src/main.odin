@@ -2,39 +2,41 @@ package main
 
 import rl "vendor:raylib"
 
+clear_world_chunks :: proc(w: ^World) {
+	for _, m in w.chunks do rl.UnloadMesh(m)
+	clear(&w.chunks)
+}
+
 main :: proc() {
 	rl.SetConfigFlags({.WINDOW_RESIZABLE, .VSYNC_HINT})
 	rl.InitWindow(INTERNAL_W * WINDOW_SCALE, INTERNAL_H * WINDOW_SCALE, WINDOW_TITLE)
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
 
-	renderer := renderer_init()
-	defer renderer_destroy(&renderer)
-
-	player := player_init()
+	r := renderer_init()
+	defer renderer_destroy(&r)
+	p := player_init()
 	rl.DisableCursor()
-
-	world := world_init(renderer.shader)
-	defer world_destroy(&world)
-
-	dev := devmap_init()
+	w := world_init(r.shader)
+	defer world_destroy(&w)
+	d := devmap_init()
+	defer devmap_destroy(&d)
 
 	for !rl.WindowShouldClose() {
 		dt := rl.GetFrameTime()
-
-		devmap_update(&dev, &player)
-		renderer_handle_keys(&renderer)
-		if !dev.open do player_update(&player, dt)
-
-		world_update(&world, player.cam.position)
-
-		if dev.open {
-			devmap_draw(&dev, player.cam.position, player.yaw)
-		} else {
-			scene_draw(&renderer, &world, player.cam)
-			renderer_present(&renderer)
+		devmap_update(&d, &p)
+		renderer_handle_keys(&r)
+		if !d.open do player_update(&p, dt)
+		if level_dirty {
+			clear_world_chunks(&w)
+			level_dirty = false
 		}
-
+		world_update(&w, p.cam.position)
+		if d.open do devmap_draw(&d, p.cam.position, p.yaw)
+		else {
+			scene_draw(&r, &w, p.cam)
+			renderer_present(&r, p.fade)
+		}
 		free_all(context.temp_allocator)
 	}
 }

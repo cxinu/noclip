@@ -3,11 +3,6 @@ package main
 import "core:math"
 import rl "vendor:raylib"
 
-// Rendering pipeline:
-//   1. scene_draw() renders the world into target (INTERNAL_W x INTERNAL_H)
-//   2. renderer_present() bright-passes + blurs target into bloom_target
-//   3. the post shader composites scene + bloom, quantises/dithers, and
-//      upscales target to the window with an aspect-correct viewport
 Renderer :: struct {
 	target:       rl.RenderTexture2D,
 	bloom_target: rl.RenderTexture2D,
@@ -22,12 +17,9 @@ Renderer :: struct {
 renderer_init :: proc() -> Renderer {
 	r: Renderer
 
-	// Scene target: rendered at the internal PS1 resolution. The post shader
-	// samples it with texelFetch (nearest); BILINEAR only softens the bloom pass.
 	r.target = rl.LoadRenderTexture(INTERNAL_W, INTERNAL_H)
 	rl.SetTextureFilter(r.target.texture, .BILINEAR)
 
-	// --- world shader ---
 	r.shader = rl.LoadShader(SHADER_OBJ_VS, SHADER_OBJ_FS)
 
 	res := rl.Vector2{f32(INTERNAL_W), f32(INTERNAL_H)}
@@ -42,7 +34,6 @@ renderer_init :: proc() -> Renderer {
 	rl.SetShaderValue(r.shader, rl.GetShaderLocation(r.shader, "fogColor"), &fog_color, .VEC3)
 	rl.SetShaderValue(r.shader, rl.GetShaderLocation(r.shader, "fogRange"), &fog_range, .VEC2)
 
-	// --- post shader ---
 	r.post = rl.LoadShader(nil, SHADER_POST_FS)
 
 	r.color_depth = DEFAULT_COLOR_DEPTH
@@ -54,9 +45,13 @@ renderer_init :: proc() -> Renderer {
 	rl.SetShaderValue(r.post, rl.GetShaderLocation(r.post, "gamma"), &r.gamma, .FLOAT)
 
 	bloom_strength := f32(BLOOM_STRENGTH)
-	rl.SetShaderValue(r.post, rl.GetShaderLocation(r.post, "bloomStrength"), &bloom_strength, .FLOAT)
+	rl.SetShaderValue(
+		r.post,
+		rl.GetShaderLocation(r.post, "bloomStrength"),
+		&bloom_strength,
+		.FLOAT,
+	)
 
-	// --- bloom pass ---
 	bloom_w := i32(INTERNAL_W / BLOOM_SCALE)
 	bloom_h := i32(INTERNAL_H / BLOOM_SCALE)
 	r.bloom_target = rl.LoadRenderTexture(bloom_w, bloom_h)
@@ -65,10 +60,20 @@ renderer_init :: proc() -> Renderer {
 	r.bloom_shader = rl.LoadShader(nil, SHADER_BLOOM_FS)
 
 	texel := rl.Vector2{1.0 / f32(bloom_w), 1.0 / f32(bloom_h)}
-	rl.SetShaderValue(r.bloom_shader, rl.GetShaderLocation(r.bloom_shader, "texelSize"), &texel, .VEC2)
+	rl.SetShaderValue(
+		r.bloom_shader,
+		rl.GetShaderLocation(r.bloom_shader, "texelSize"),
+		&texel,
+		.VEC2,
+	)
 
 	threshold := f32(BLOOM_THRESHOLD)
-	rl.SetShaderValue(r.bloom_shader, rl.GetShaderLocation(r.bloom_shader, "threshold"), &threshold, .FLOAT)
+	rl.SetShaderValue(
+		r.bloom_shader,
+		rl.GetShaderLocation(r.bloom_shader, "threshold"),
+		&threshold,
+		.FLOAT,
+	)
 
 	return r
 }
@@ -88,13 +93,15 @@ renderer_destroy :: proc(r: ^Renderer) {
 	rl.UnloadRenderTexture(r.bloom_target)
 }
 
-renderer_present :: proc(r: ^Renderer) {
+// fade: 0.0 = fully visible, 1.0 = fully black. Drawn on top of everything so
+// level transitions are hidden without the shader chain quantizing the fade.
+renderer_present :: proc(r: ^Renderer, fade: f32 = 0) {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.BLACK)
 
 	src := rl.Rectangle{0, 0, f32(INTERNAL_W), f32(-INTERNAL_H)}
 
-	// 1. Bloom: full-res scene -> reduced-res bright blur.
+	// 1. Bloom pass
 	rl.BeginTextureMode(r.bloom_target)
 	rl.ClearBackground(rl.BLACK)
 	rl.BeginShaderMode(r.bloom_shader)
@@ -109,16 +116,26 @@ renderer_present :: proc(r: ^Renderer) {
 	rl.EndShaderMode()
 	rl.EndTextureMode()
 
-	// 2. Post: scene + bloom -> window, aspect-correct with nearest upscale.
-	rl.SetShaderValueTexture(r.post, rl.GetShaderLocation(r.post, "bloomTex"), r.bloom_target.texture)
+	// 2. Post pass
+	rl.SetShaderValueTexture(
+		r.post,
+		rl.GetShaderLocation(r.post, "bloomTex"),
+		r.bloom_target.texture,
+	)
 	rl.BeginShaderMode(r.post)
 	rl.DrawTexturePro(r.target.texture, src, renderer_viewport(), {0, 0}, 0, rl.WHITE)
 	rl.EndShaderMode()
 
+	// 3. Fade overlay — outside the shader, so it's pure black over the
+	//    full window (letterbox + viewport), not quantized/dithered.
+	if fade > 0 {
+		a := u8(clamp(fade, 0, 1) * 255 + 0.5)
+		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), {0, 0, 0, a})
+	}
+
 	rl.EndDrawing()
 }
 
-// Largest 4:3 rectangle that fits the window, centred, snapped to whole pixels.
 renderer_viewport :: proc() -> rl.Rectangle {
 	sw := f32(rl.GetScreenWidth())
 	sh := f32(rl.GetScreenHeight())
