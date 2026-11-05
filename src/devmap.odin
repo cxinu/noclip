@@ -53,7 +53,7 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		if m.open {
 			rl.EnableCursor()
 			m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL
-			m.view_level = current_level
+			m.view_level = current_floor
 		} else {rl.DisableCursor()}
 	}
 	if !m.open do return
@@ -68,12 +68,19 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		.C,
 	) {m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL}
 	if rl.IsKeyPressed(.RIGHT_BRACKET) || rl.IsKeyPressed(.PAGE_UP) {
-		m.view_level = (m.view_level + 1) %% NUM_LEVELS
+		m.view_level += 1
 	}
 	if rl.IsKeyPressed(.LEFT_BRACKET) || rl.IsKeyPressed(.PAGE_DOWN) {
-		m.view_level = (m.view_level - 1) %% NUM_LEVELS
+		m.view_level -= 1
 	}
-	if rl.IsKeyPressed(.ENTER) {set_level(m.view_level)}
+	if rl.IsKeyPressed(.ENTER) {
+		set_current_floor(m.view_level)
+		player.feet_y = ground_at(player.cam.position.x, player.cam.position.z)
+		player.eye_y = player.feet_y + EYE_H
+		player.cam.position.y = player.eye_y
+		player.grounded = true
+		player.vel_y = 0
+	}
 
 	mp := rl.GetMousePosition()
 	over_hud := mp.x < HUD_W && mp.y < HUD_H
@@ -81,9 +88,14 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		sw, sh := f32(rl.GetScreenWidth()), f32(rl.GetScreenHeight())
 		wx := (mp.x - (sw / 2 - m.cx * m.zoom)) / m.zoom
 		wz := (mp.y - (sh / 2 - m.cz * m.zoom)) / m.zoom
-		set_level(m.view_level)
+		set_current_floor(m.view_level)
 		player.cam.position.x = (math.floor(wx) + 0.5) * CELL
 		player.cam.position.z = (math.floor(wz) + 0.5) * CELL
+		player.feet_y = ground_at(player.cam.position.x, player.cam.position.z)
+		player.eye_y = player.feet_y + EYE_H
+		player.cam.position.y = player.eye_y
+		player.grounded = true
+		player.vel_y = 0
 	}
 }
 
@@ -124,9 +136,13 @@ tint_by_floor :: proc(c: rl.Color, lvl: i8) -> rl.Color {
 }
 
 devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
-	player_level := current_level
-	current_level = m.view_level
-	defer current_level = player_level
+	player_floor := current_floor
+	current_floor = m.view_level
+	last_region = nil
+	defer {
+		current_floor = player_floor
+		last_region = nil
+	}
 
 	rl.BeginDrawing()
 	rl.ClearBackground({15, 15, 20, 255})
@@ -243,7 +259,7 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 
 	// Player
 	pc := rl.Vector2{ox + pos.x / CELL * s, oy + pos.z / CELL * s}
-	pcol := rl.RED if player_level == m.view_level else rl.Color{160, 160, 160, 255}
+	pcol := rl.RED if player_floor == m.view_level else rl.Color{160, 160, 160, 255}
 	rl.DrawCircleV(pc, 5, pcol)
 	rl.DrawLineEx(pc, pc + {math.sin(yaw), math.cos(yaw)} * 18, 2, pcol)
 
@@ -276,17 +292,17 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		fmt.ctprintf(
 			"viewing floor %d: %s%s",
 			m.view_level,
-			LEVELS[m.view_level].name,
-			" (you are here)" if player_level == m.view_level else "",
+			LEVELS[current_level].name,
+			" (you are here)" if player_floor == m.view_level else "",
 		),
 		10,
 		56,
 		10,
-		rl.YELLOW if player_level != m.view_level else rl.WHITE,
+		rl.YELLOW if player_floor != m.view_level else rl.WHITE,
 	)
-	if player_level != m.view_level {
+	if player_floor != m.view_level {
 		rl.DrawText(
-			fmt.ctprintf("you are on floor %d: %s", player_level, LEVELS[player_level].name),
+			fmt.ctprintf("you are on floor %d: %s", player_floor, LEVELS[current_level].name),
 			10,
 			68,
 			10,
@@ -330,29 +346,33 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		10,
 		{255, 200, 120, 255} if lvl > 0 else ({120, 200, 255, 255} if lvl < 0 else rl.WHITE),
 	)
-	// NEW: transition features
-	if stair_at(hx, hz) {
-		dirs := [4]string{"N", "S", "E", "W"}
-		dir_name := dirs[stair_dir_at(hx, hz) & 3]
-		rl.DrawText(
-			fmt.ctprintf("STAIR up to L%d (dir %s)", (m.view_level + 1) %% NUM_LEVELS, dir_name),
-			10,
-			y + 48,
-			10,
-			rl.YELLOW,
-		)
-
-	} else if hole_at(hx, hz) {
-		rl.DrawText(
-			fmt.ctprintf(
-				"SHAFT down to L%d",
-				((m.view_level - 1) %% NUM_LEVELS + NUM_LEVELS) %% NUM_LEVELS,
-			),
-			10,
-			y + 48,
-			10,
-			{240, 120, 120, 255},
-		)
+	// Vertical-link information for the hovered cell.
+	if link, has_link, role := vertical_link_at(hx, hz); has_link {
+		kind_name := "STAIRS"
+		switch link.kind {
+		case .Stairs:
+			kind_name = "STAIRS"
+		case .Switchback:
+			kind_name = "SWITCHBACK"
+		case .Ramp:
+			kind_name = "RAMP"
+		case .Drop:
+			kind_name = "DROP"
+		case .Slide:
+			kind_name = "SLIDE"
+		}
+		message: cstring = ""
+		color := rl.YELLOW
+		if role == .Upper {
+			message = fmt.ctprintf("%s down to floor %d", kind_name, m.view_level - 1)
+			color = {240, 130, 130, 255}
+		} else if link.kind == .Stairs || link.kind == .Switchback || link.kind == .Ramp {
+			message = fmt.ctprintf("%s up to floor %d", kind_name, m.view_level + 1)
+		} else {
+			message = fmt.ctprintf("%s landing from floor %d", kind_name, m.view_level + 1)
+			color = {160, 190, 255, 255}
+		}
+		rl.DrawText(message, 10, y + 48, 10, color)
 	}
 
 	// While inspecting the map, retain regions around the map viewport rather

@@ -10,7 +10,8 @@ CHUNK_SIZE :: 16
 CHUNK_W :: CHUNK_SIZE * CELL
 VIEW_RADIUS :: 1
 
-// Floor verticality (unchanged)
+// Vertical floors are generated in local coordinates and separated in world space.
+FLOOR_SPACING :: 6.0
 FLOOR_STEP :: 0.35
 MAX_FLOOR_LEVELS :: 3
 
@@ -68,15 +69,32 @@ LEVELS := [NUM_LEVELS]Level_Def {
 	{"Level 23", .Concrete_Maze, 0.25},
 }
 
+// current_floor is an unbounded physical floor index. current_level selects
+// the biome/theme profile and cycles through LEVELS independently.
+current_floor: i32
 current_level: i32
 level_dirty: bool
 
+floor_world_offset :: proc(floor: i32) -> f32 {
+	return f32(floor) * FLOOR_SPACING
+}
+
+floor_mod :: proc(v, n: i32) -> i32 {return ((v %% n) + n) %% n}
+
 level_seed :: proc() -> u32 {return WORLD_SEED + u32(current_level) * 2246822519}
 
+set_current_floor :: proc(f: i32) {
+	if f == current_floor do return
+	current_floor = f
+	last_region = nil
+	level_dirty = true
+}
+
+// Backrooms theme selection remains independent of physical floor movement.
 set_level :: proc(l: i32) {
-	nl := ((l %% NUM_LEVELS) + NUM_LEVELS) %% NUM_LEVELS
-	if nl == current_level do return
-	current_level = nl
+	next := floor_mod(l, NUM_LEVELS)
+	if next == current_level do return
+	current_level = next
 	last_region = nil
 	level_dirty = true
 }
@@ -212,16 +230,58 @@ bfbm :: proc(x, y: f32, seed: i32) -> f32 {
 	return sum / norm
 }
 
-biome_info_raw :: proc(x, z: i32) -> Biome_Info {
+hash01_for_floor :: proc(x, y, seed, floor, theme: i32) -> f32 {
+	world_seed := i32(WORLD_SEED + u32(floor) * 2246822519 + u32(theme) * 3266489917)
+	return f32(raw_hash(x + seed * 7919, y - seed * 104729 + world_seed) >> 8) / 16777216.0
+}
+
+bnoise_for_floor :: proc(x, y: f32, seed, floor, theme: i32) -> f32 {
+	xf, yf := math.floor(x), math.floor(y)
+	xi, yi := i32(xf), i32(yf)
+	fx, fy := x - xf, y - yf
+	sx := fx * fx * (3 - 2 * fx)
+	sy := fy * fy * (3 - 2 * fy)
+	n00 := hash01_for_floor(xi, yi, seed, floor, theme)
+	n10 := hash01_for_floor(xi + 1, yi, seed, floor, theme)
+	n01 := hash01_for_floor(xi, yi + 1, seed, floor, theme)
+	n11 := hash01_for_floor(xi + 1, yi + 1, seed, floor, theme)
+	top := n00 + (n10 - n00) * sx
+	bot := n01 + (n11 - n01) * sx
+	return top + (bot - top) * sy
+}
+
+bfbm_for_floor :: proc(x, y: f32, seed, floor, theme: i32) -> f32 {
+	sum, amp, norm: f32 = 0, 1, 0
+	fx, fy := x, y
+	for o in 0 ..< 3 {
+		sum += amp * bnoise_for_floor(fx, fy, seed + i32(o), floor, theme)
+		norm += amp
+		amp *= 0.5
+		fx *= 2.1
+		fy *= 2.1
+	}
+	return sum / norm
+}
+
+biome_info_raw_for_level :: proc(x, z, floor, theme: i32, bleed_depth: i32 = 0) -> Biome_Info {
+	// Roughly one patch in five inherits the biome map of the floor below.
+	// Patch coordinates are deliberately coarser than biome cells.
+	patch_x, patch_z := fdiv(x, 18), fdiv(z, 18)
+	bleed_hash := raw_hash(patch_x + i32(WORLD_SEED), patch_z + floor * 7919 + theme * 104729)
+	if bleed_depth < 16 && bleed_hash %% 5 == 0 {
+		return biome_info_raw_for_level(x, z, floor - 1, theme, bleed_depth + 1)
+	}
+
 	px, pz := f32(x) + 0.5, f32(z) + 0.5
-	wx := px + (bnoise(px * 0.022, pz * 0.022, 91) - 0.5) * 36
-	wz := pz + (bnoise(px * 0.022 + 40.1, pz * 0.022 - 17.7, 92) - 0.5) * 36
-	fa := bfbm(wx / BIOME_SCALE, wz / BIOME_SCALE, 11)
-	fb := bfbm(wx / BIOME_SCALE + 31.7, wz / BIOME_SCALE - 12.9, 13)
+	wx := px + (bnoise_for_floor(px * 0.022, pz * 0.022, 91, floor, theme) - 0.5) * 36
+	wz :=
+		pz + (bnoise_for_floor(px * 0.022 + 40.1, pz * 0.022 - 17.7, 92, floor, theme) - 0.5) * 36
+	fa := bfbm_for_floor(wx / BIOME_SCALE, wz / BIOME_SCALE, 11, floor, theme)
+	fb := bfbm_for_floor(wx / BIOME_SCALE + 31.7, wz / BIOME_SCALE - 12.9, 13, floor, theme)
 	fa = clamp(0.5 + (fa - 0.5) * BIOME_CONTRAST, 0, 1)
 	fb = clamp(0.5 + (fb - 0.5) * BIOME_CONTRAST, 0, 1)
 
-	lv := LEVELS[current_level]
+	lv := LEVELS[floor_mod(theme, NUM_LEVELS)]
 	spawn := clamp(1 - math.sqrt(px * px + pz * pz) / 40, 0, 1)
 
 	best, second: f32 = 1e9, 1e9
@@ -242,19 +302,23 @@ biome_info_raw :: proc(x, z: i32) -> Biome_Info {
 	return Biome_Info{b = bi, b2 = si, w = 0.5 + 0.5 * m}
 }
 
+biome_info_raw :: proc(x, z: i32) -> Biome_Info {
+	return biome_info_raw_for_level(x, z, current_floor, current_level)
+}
+
 BIOME_CACHE_N :: 16384
 Biome_Cache_Entry :: struct {
-	x, z, lvl: i32,
-	valid:     bool,
-	info:      Biome_Info,
+	x, z, floor, theme: i32,
+	valid:              bool,
+	info:               Biome_Info,
 }
 biome_cache: [BIOME_CACHE_N]Biome_Cache_Entry
 
 biome_info :: proc(x, z: i32) -> Biome_Info {
-	lvl := current_level
-	e := &biome_cache[raw_hash(x, z + lvl * 7717) & (BIOME_CACHE_N - 1)]
-	if e.valid && e.x == x && e.z == z && e.lvl == lvl do return e.info
-	e.x, e.z, e.lvl, e.valid = x, z, lvl, true
+	floor, theme := current_floor, current_level
+	e := &biome_cache[raw_hash(x, z + floor * 7717 + theme * 131071) & (BIOME_CACHE_N - 1)]
+	if e.valid && e.x == x && e.z == z && e.floor == floor && e.theme == theme do return e.info
+	e.x, e.z, e.floor, e.theme, e.valid = x, z, floor, theme, true
 	e.info = biome_info_raw(x, z)
 	return e.info
 }
@@ -281,9 +345,33 @@ EDGE_DOOR :: 2
 
 CELL_PILLAR :: 1
 CELL_POOL :: 2
-// NEW: transition flags
-CELL_STAIR :: 4
-CELL_HOLE :: 8
+CELL_STAIR :: 4 // legacy debug flag; new links use CELL_LINK
+CELL_HOLE :: 8 // legacy debug flag; new links use CELL_LINK
+CELL_LINK :: 16
+
+Link_Kind :: enum {
+	Stairs,
+	Switchback,
+	Ramp,
+	Drop,
+	Slide,
+}
+Link_Role :: enum {
+	None,
+	Lower,
+	Upper,
+}
+
+Vertical_Link :: struct {
+	x, z:           i32,
+	w, d:           i32,
+	lower_floor:    i32,
+	kind:           Link_Kind,
+	direction:      u8, // 0=N, 1=S, 2=E, 3=W: direction of ascent
+	entry_side:     u8,
+	opening_width:  i32,
+	opening_offset: i32,
+}
 
 SPAWN_CLEAR :: 2
 
@@ -320,18 +408,26 @@ GEN := [Biome_Type]Gen_Params {
 }
 
 Region :: struct {
-	level:                    i32,
+	floor, theme:             i32,
 	x0, z0, w, h:             i32,
 	edge_w, edge_n, cell_flg: []u8,
 	cell_floor:               []i8,
-	cell_stair:               []u8, // NEW: 0=N, 1=S, 2=E, 3=W direction of ascent
+	cell_stair:               []u8, // legacy compatibility
+	cell_link_id:             []i16,
+	cell_link_role:           []u8,
+	links:                    [2]Vertical_Link,
+	link_count:               int,
 }
 
-regions: map[[3]i32]^Region
+regions: map[[4]i32]^Region
 last_region: ^Region
 
 fdiv :: proc(a, b: i32) -> i32 {return (a - a %% b) / b}
-lh :: proc(a, b: i32) -> u32 {return raw_hash(a, b ~ i32(level_seed() * 2654435761))}
+layout_hash :: proc(a, b: i32) -> u32 {return raw_hash(
+		a + i32(WORLD_SEED),
+		b ~ i32(WORLD_SEED * 2654435761),
+	)}
+lh :: proc(a, b: i32) -> u32 {return layout_hash(a, b)}
 
 Rng :: struct {
 	s: u32,
@@ -365,9 +461,11 @@ region_idx :: proc(r: ^Region, x, z: i32) -> int {
 }
 
 region_at :: proc(x, z: i32) -> ^Region {
+	if regions == nil do regions = make(map[[4]i32]^Region)
 	if lr := last_region;
 	   lr != nil &&
-	   lr.level == current_level &&
+	   lr.floor == current_floor &&
+	   lr.theme == current_level &&
 	   x >= lr.x0 &&
 	   x < lr.x0 + lr.w &&
 	   z >= lr.z0 &&
@@ -376,10 +474,11 @@ region_at :: proc(x, z: i32) -> ^Region {
 	}
 	i := reg_col_of(x)
 	j := reg_row_of(i, z)
-	key := [3]i32{current_level, i, j}
+	key := [4]i32{current_floor, current_level, i, j}
 	if found, ok := regions[key]; ok {last_region = found; return found}
 	r := new(Region)
-	r.level = current_level
+	r.floor = current_floor
+	r.theme = current_level
 	r.x0 = reg_col_line(i)
 	r.z0 = reg_row_line(i, j)
 	r.w = reg_col_line(i + 1) - r.x0
@@ -389,25 +488,30 @@ region_at :: proc(x, z: i32) -> ^Region {
 	r.edge_n = make([]u8, n)
 	r.cell_flg = make([]u8, n)
 	r.cell_floor = make([]i8, n)
-	r.cell_stair = make([]u8, n) // NEW
+	r.cell_stair = make([]u8, n) // legacy compatibility
+	r.cell_link_id = make([]i16, n)
+	r.cell_link_role = make([]u8, n)
+	for k in 0 ..< n do r.cell_link_id[k] = -1
 	generate_region(r, i, j)
 	regions[key] = r
 	last_region = r
 	return r
 }
 
-// Keep only regions near the player on the active level. The world is
+// Keep only regions near the player on the active physical floor. The world is
 // deterministic, so evicted regions can be regenerated without state loss.
 // This bounds memory use during long exploratory sessions.
 regions_trim :: proc(cell_x, cell_z: i32, radius: i32 = 2) {
 	center_i := reg_col_of(cell_x)
 	center_j := reg_row_of(center_i, cell_z)
-	stale := make([dynamic][3]i32, context.temp_allocator)
+	stale := make([dynamic][4]i32, context.temp_allocator)
 
 	for key in regions {
-		nearby := key[0] == current_level &&
-			abs(key[1] - center_i) <= radius &&
-			abs(key[2] - center_j) <= radius
+		nearby :=
+			key[0] == current_floor &&
+			key[1] == current_level &&
+			abs(key[2] - center_i) <= radius &&
+			abs(key[3] - center_j) <= radius
 		if !nearby do append(&stale, key)
 	}
 
@@ -418,6 +522,8 @@ regions_trim :: proc(cell_x, cell_z: i32, radius: i32 = 2) {
 			delete(r.cell_flg)
 			delete(r.cell_floor)
 			delete(r.cell_stair)
+			delete(r.cell_link_id)
+			delete(r.cell_link_role)
 			free(r)
 			delete_key(&regions, key)
 		}
@@ -512,6 +618,40 @@ door_count :: proc(rng: ^Rng, n: i32) -> i32 {
 	return c
 }
 
+place_hall_building :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32) {
+	if w < 9 || h < 9 do return
+	bw := rng_range(rng, 2, min(4, w - 6))
+	bh := rng_range(rng, 2, min(4, h - 6))
+	if bw < 2 || bh < 2 do return
+	bx := rng_range(rng, x + 2, x + w - bw - 2)
+	bz := rng_range(rng, z + 2, z + h - bh - 2)
+
+	for zz in bz ..< bz + bh {
+		for xx in bx ..< bx +
+			bw {r.cell_flg[region_idx(r, xx, zz)] &= ~u8(CELL_PILLAR | CELL_POOL)}
+		set_w(r, bx, zz, EDGE_WALL)
+		set_w(r, bx + bw, zz, EDGE_WALL)
+	}
+	for xx in bx ..< bx + bw {
+		set_n(r, xx, bz, EDGE_WALL)
+		set_n(r, xx, bz + bh, EDGE_WALL)
+	}
+
+	// One generated doorway; some variants have one or two collapsed wall gaps.
+	door_side := rng_range(rng, 0, 3)
+	if door_side == 0 {set_n(r, rng_range(rng, bx, bx + bw - 1), bz, EDGE_DOOR)}
+	if door_side == 1 {set_n(r, rng_range(rng, bx, bx + bw - 1), bz + bh, EDGE_DOOR)}
+	if door_side == 2 {set_w(r, bx + bw, rng_range(rng, bz, bz + bh - 1), EDGE_DOOR)}
+	if door_side == 3 {set_w(r, bx, rng_range(rng, bz, bz + bh - 1), EDGE_DOOR)}
+	if rng_chance(rng, 92) {
+		ruin_side := (door_side + 1 + rng_range(rng, 0, 2)) %% 4
+		if ruin_side == 0 {set_n(r, bx + rng_range(rng, 0, bw - 1), bz, EDGE_OPEN)}
+		if ruin_side == 1 {set_n(r, bx + rng_range(rng, 0, bw - 1), bz + bh, EDGE_OPEN)}
+		if ruin_side == 2 {set_w(r, bx + bw, bz + rng_range(rng, 0, bh - 1), EDGE_OPEN)}
+		if ruin_side == 3 {set_w(r, bx, bz + rng_range(rng, 0, bh - 1), EDGE_OPEN)}
+	}
+}
+
 finish_leaf :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32, gp: Gen_Params) {
 	hall := w >= 6 && h >= 6
 	base: i8 = 0
@@ -542,6 +682,7 @@ finish_leaf :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32, gp: Gen_Params) {
 			if rng_u32(rng) % 12 == 0 do continue
 			set_cell(r, x + lx, z + lz, CELL_PILLAR)
 		}
+		if rng_chance(rng, 45) do place_hall_building(r, rng, x, z, w, h)
 		return
 	}
 	if w >= 4 && h >= 4 && rng_chance(rng, gp.closet) {
@@ -558,6 +699,7 @@ finish_leaf :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32, gp: Gen_Params) {
 			rng,
 		) {set_w(r, vx, rng_range(rng, cz0, cz0 + ch - 1), EDGE_DOOR)} else {set_n(r, rng_range(rng, cx0, cx0 + cw - 1), hz, EDGE_DOOR)}
 	}
+	if hall && rng_chance(rng, 45) do place_hall_building(r, rng, x, z, w, h)
 }
 
 corridor_split :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32, gp: Gen_Params) -> bool {
@@ -633,61 +775,170 @@ bsp :: proc(r: ^Region, rng: ^Rng, x, z, w, h: i32) {
 	}
 }
 
-// ───────────────────────── NEW: transition architecture ─────────────────────────
+// ───────────────────────── shared vertical-link layout ─────────────────────────
 
-// Seeded from WORLD_SEED only — the same (x, z) is a stairwell / hole on every
-// floor. That's what makes vertical travel through the backrooms *feel* like a
-// real building.
-stair_site :: proc(ri, rj: i32) -> bool {
-	return raw_hash(ri + i32(WORLD_SEED), rj - i32(WORLD_SEED * 7)) % 5 == 0
-}
-hole_site :: proc(ri, rj: i32) -> bool {
-	return raw_hash(ri - i32(WORLD_SEED * 3), rj + i32(WORLD_SEED)) % 7 == 0
-}
-stair_dir_for :: proc(ri, rj: i32) -> u8 {
-	return u8(raw_hash(ri + 91, rj + 17) & 3)
+link_hash :: proc(ri, rj, pair_floor, salt: i32) -> u32 {
+	return raw_hash(
+		ri * 4099 + pair_floor * 7919 + salt + i32(WORLD_SEED),
+		rj * 8191 - pair_floor * 104729,
+	)
 }
 
-// Clear a 3×3 neighbourhood's walls so the stair/hole reads as a landing that
-// merges into the surrounding BSP structure.
-clear_walls_3x3 :: proc(r: ^Region, sx, sz: i32) {
-	for dz in -1 ..= 1 do for dx in -1 ..= 1 {
-		set_edge(r, true, sx + i32(dx), sz + i32(dz), EDGE_OPEN)
-		set_edge(r, false, sx + i32(dx), sz + i32(dz), EDGE_OPEN)
+link_rect_free :: proc(r: ^Region, x, z, w, d: i32) -> bool {
+	if x < r.x0 + 2 || z < r.z0 + 2 || x + w >= r.x0 + r.w - 2 || z + d >= r.z0 + r.h - 2 do return false
+	for zz in z ..< z + d do for xx in x ..< x + w {
+		i := region_idx(r, xx, zz)
+		if r.cell_link_id[i] >= 0 do return false
+	}
+	return true
+}
+
+link_side_open :: proc(l: Vertical_Link, role: Link_Role, side: u8) -> bool {
+	if l.kind == .Drop {
+		return side == (l.direction if role == .Upper else l.entry_side)
+	}
+	if l.kind == .Slide {
+		if role == .Lower do return side == l.entry_side
+		return side == l.direction || side == l.entry_side
+	}
+	if l.kind == .Switchback do return side == l.entry_side
+	// Walkable stairs and ramps need an entry and a seam opening at the far end.
+	return side == l.entry_side || side == l.direction
+}
+
+link_open_offset :: proc(l: Vertical_Link, side: u8, wx, wz: i32) -> bool {
+	offset := wx - l.x if side < 2 else wz - l.z
+	return offset >= l.opening_offset && offset < l.opening_offset + l.opening_width
+}
+
+link_clear_rect :: proc(r: ^Region, l: Vertical_Link, role: Link_Role, id: i16) {
+	// Internal edges are open; the rectangle perimeter is enclosed except for
+	// the entry/exit apertures dictated by the link type.
+	for z in l.z ..< l.z + l.d do for x in l.x ..< l.x + l.w {
+		i := region_idx(r, x, z)
+		r.cell_flg[i] &= ~u8(CELL_PILLAR | CELL_POOL | CELL_STAIR | CELL_HOLE)
+		r.cell_flg[i] |= CELL_LINK
+		r.cell_floor[i] = 0
+		r.cell_link_id[i] = id
+		r.cell_link_role[i] = u8(role)
+		if x > l.x do set_w(r, x, z, EDGE_OPEN)
+		if z > l.z do set_n(r, x, z, EDGE_OPEN)
+	}
+	// A switchback is two parallel flights joined by a one-cell landing.
+	// Keep a divider between the flights, ending it before the turn so the
+	// player can walk around the U at the far end.
+	if l.kind == .Switchback {
+		if l.direction < 2 {
+			divider_x := l.x + l.w / 2
+			for z in l.z ..< l.z + l.d {
+				at_turn :=
+					(l.direction == 0 && z == l.z) || (l.direction == 1 && z == l.z + l.d - 1)
+				if !at_turn do set_w(r, divider_x, z, EDGE_WALL)
+			}
+		} else {
+			divider_z := l.z + l.d / 2
+			for x in l.x ..< l.x + l.w {
+				at_turn :=
+					(l.direction == 2 && x == l.x + l.w - 1) || (l.direction == 3 && x == l.x)
+				if !at_turn do set_n(r, x, divider_z, EDGE_WALL)
+			}
+		}
+	}
+	for z in l.z ..< l.z + l.d {
+		set_w(r, l.x, z, EDGE_WALL)
+		set_w(r, l.x + l.w, z, EDGE_WALL)
+	}
+	for x in l.x ..< l.x + l.w {
+		set_n(r, x, l.z, EDGE_WALL)
+		set_n(r, x, l.z + l.d, EDGE_WALL)
+	}
+	for side in 0 ..< 4 {
+		s := u8(side)
+		if !link_side_open(l, role, s) do continue
+		for q in l.opening_offset ..< l.opening_offset + l.opening_width {
+			switch s {
+			case 0:
+				set_n(r, l.x + q, l.z, EDGE_OPEN) // north
+			case 1:
+				set_n(r, l.x + q, l.z + l.d, EDGE_OPEN) // south
+			case 2:
+				set_w(r, l.x + l.w, l.z + q, EDGE_OPEN) // east
+			case 3:
+				set_w(r, l.x, l.z + q, EDGE_OPEN) // west
+			}
+		}
 	}
 }
 
-place_stairwell :: proc(r: ^Region, ri, rj: i32) {
-	cx_rel := i32(4 + raw_hash(ri, rj + 5) % 8)
-	cz_rel := i32(4 + raw_hash(ri + 3, rj) % 8)
-	sx := r.x0 + cx_rel
-	sz := r.z0 + cz_rel
-	if sx >= r.x0 + r.w - 2 || sz >= r.z0 + r.h - 2 do return
-	if abs(sx) <= SPAWN_CLEAR + 4 && abs(sz) <= SPAWN_CLEAR + 4 do return
-
-	clear_walls_3x3(r, sx, sz)
-	i := region_idx(r, sx, sz)
-	r.cell_flg[i] &= ~u8(CELL_PILLAR | CELL_POOL)
-	r.cell_flg[i] |= CELL_STAIR
-	r.cell_floor[i] = 0
-	r.cell_stair[i] = stair_dir_for(ri, rj)
-}
-
-place_hole :: proc(r: ^Region, ri, rj: i32) {
-	cx_rel := i32(4 + raw_hash(ri + 11, rj) % 8)
-	cz_rel := i32(4 + raw_hash(ri, rj + 13) % 8)
-	sx := r.x0 + cx_rel
-	sz := r.z0 + cz_rel
-	if sx >= r.x0 + r.w - 2 || sz >= r.z0 + r.h - 2 do return
-	if abs(sx) <= SPAWN_CLEAR + 4 && abs(sz) <= SPAWN_CLEAR + 4 do return
-	// Never overlap a stairwell
-	if r.cell_flg[region_idx(r, sx, sz)] & CELL_STAIR != 0 do return
-
-	clear_walls_3x3(r, sx, sz)
-	i := region_idx(r, sx, sz)
-	r.cell_flg[i] &= ~u8(CELL_PILLAR | CELL_POOL)
-	r.cell_flg[i] |= CELL_HOLE
-	r.cell_floor[i] = 0
+place_vertical_link :: proc(r: ^Region, ri, rj, pair_floor: i32, role: Link_Role) {
+	h := link_hash(ri, rj, pair_floor, 17)
+	if h %% 4 != 0 || r.link_count >= 2 do return
+	kind := Link_Kind((h >> 4) %% 5)
+	w, d: i32
+	switch kind {
+	case .Stairs:
+		w, d = 2 + i32((h >> 8) & 1), 3 + i32((h >> 9) & 3)
+	case .Switchback:
+		// Even lane counts keep the U divider exactly on a cell boundary.
+		w, d = 4, 4 + 2 * i32((h >> 8) & 1)
+	case .Ramp:
+		w, d = 3, 4 + i32((h >> 9) & 3)
+	case .Drop:
+		w, d = 3 + i32((h >> 8) & 7), 3 + i32((h >> 12) & 7)
+	case .Slide:
+		w, d = 2 + i32((h >> 8) & 1), 3 + i32((h >> 9) & 3)
+	}
+	// Keep ordinary link footprints compact; drops may expand into atriums up to 10x10.
+	w = min(w, min(r.w - 8, 10))
+	d = min(d, min(r.h - 8, 10))
+	if w < 2 || d < 2 do return
+	// Adjacent link pairs occupy opposite sides of the region. This guarantees
+	// that lower/upper pair footprints agree even though adjacent pairs coexist.
+	span_z := max(r.h - d - 6, 1)
+	z := r.z0 + 3 + i32((h >> 20) % u32(span_z))
+	x: i32
+	if pair_floor %% 2 == 0 {
+		x_lo, x_hi := r.x0 + 3, r.x0 + r.w / 2 - w - 2
+		span_x := max(x_hi - x_lo + 1, 1)
+		x = x_lo + i32((h >> 16) % u32(span_x))
+	} else {
+		x_lo, x_hi := r.x0 + r.w / 2 + 2, r.x0 + r.w - w - 3
+		span_x := max(x_hi - x_lo + 1, 1)
+		x = x_lo + i32((h >> 16) % u32(span_x))
+	}
+	if abs(x + w / 2) <= SPAWN_CLEAR + 4 && abs(z + d / 2) <= SPAWN_CLEAR + 4 do return
+	if !link_rect_free(r, x, z, w, d) do return
+	entry := u8((h >> 24) & 3)
+	opening_axis := w if entry < 2 else d
+	opening_width := 1 + i32((h >> 27) & 1)
+	opening_offset: i32
+	if kind == .Switchback {
+		// The two stair flights return to the same side; leave a broad shared
+		// opening for both lanes instead of a single narrow doorway.
+		opening_width = opening_axis
+		opening_offset = 0
+	} else {
+		opening_width = min(opening_width, opening_axis)
+		opening_offset = i32((h >> 29) % u32(max(opening_axis - opening_width + 1, 1)))
+	}
+	// direction is the ascending direction; entry is normally its opposite.
+	direction := entry ~ 1
+	l := Vertical_Link {
+		x              = x,
+		z              = z,
+		w              = w,
+		d              = d,
+		lower_floor    = pair_floor,
+		kind           = kind,
+		direction      = direction,
+		entry_side     = entry,
+		opening_width  = opening_width,
+		opening_offset = opening_offset,
+	}
+	id := i16(r.link_count)
+	r.links[r.link_count] = l
+	r.link_count += 1
+	link_clear_rect(r, l, role, id)
 }
 
 generate_region :: proc(r: ^Region, ri, rj: i32) {
@@ -698,9 +949,10 @@ generate_region :: proc(r: ^Region, ri, rj: i32) {
 	punch_border(r, &rng, true)
 	punch_border(r, &rng, false)
 	bsp(r, &rng, r.x0, r.z0, r.w, r.h)
-	// NEW: vertical connectivity
-	if stair_site(ri, rj) do place_stairwell(r, ri, rj)
-	if hole_site(ri, rj) do place_hole(r, ri, rj)
+	// Each region reserves deterministic link footprints for the floor below
+	// and above. The same pair seed yields identical rectangles on both floors.
+	place_vertical_link(r, ri, rj, current_floor - 1, .Upper)
+	place_vertical_link(r, ri, rj, current_floor, .Lower)
 }
 
 // ───────────────────────── queries ─────────────────────────
@@ -725,20 +977,18 @@ pool_at :: proc(wx, wz: i32) -> bool {
 	return (r.cell_flg[region_idx(r, wx, wz)] & CELL_POOL) != 0
 }
 
-// ── NEW ──
+// Compatibility queries used by the dev map and old debug overlays.
 stair_at :: proc(wx, wz: i32) -> bool {
-	if abs(wx) <= SPAWN_CLEAR && abs(wz) <= SPAWN_CLEAR do return false
-	r := region_at(wx, wz)
-	return (r.cell_flg[region_idx(r, wx, wz)] & CELL_STAIR) != 0
+	l, ok, _ := vertical_link_at(wx, wz)
+	return ok && (l.kind == .Stairs || l.kind == .Switchback || l.kind == .Ramp)
 }
 hole_at :: proc(wx, wz: i32) -> bool {
-	if abs(wx) <= SPAWN_CLEAR && abs(wz) <= SPAWN_CLEAR do return false
-	r := region_at(wx, wz)
-	return (r.cell_flg[region_idx(r, wx, wz)] & CELL_HOLE) != 0
+	l, ok, _ := vertical_link_at(wx, wz)
+	return ok && (l.kind == .Drop || l.kind == .Slide)
 }
 stair_dir_at :: proc(wx, wz: i32) -> u8 {
-	r := region_at(wx, wz)
-	return r.cell_stair[region_idx(r, wx, wz)]
+	l, ok, _ := vertical_link_at(wx, wz)
+	return l.direction if ok else 0
 }
 
 floor_level :: proc(x, z: i32) -> i8 {
@@ -746,45 +996,142 @@ floor_level :: proc(x, z: i32) -> i8 {
 	r := region_at(x, z)
 	return r.cell_floor[region_idx(r, x, z)]
 }
-floor_h :: proc(x, z: i32) -> f32 {
-	return f32(floor_level(x, z)) * FLOOR_STEP
+
+valley_depth :: proc(x, z: i32) -> f32 {
+	distance_from_spawn := math.sqrt(f32(x) * f32(x) + f32(z) * f32(z))
+	if distance_from_spawn <= 20 do return 0
+	spawn_fade := clamp((distance_from_spawn - 20) / 20, 0, 1)
+	spawn_fade = spawn_fade * spawn_fade * (3 - 2 * spawn_fade)
+	info := biome_info(x, z)
+	biome_weight: f32 = 0
+	if info.b == .Warehouse || info.b == .Parking_Garage || info.b == .Sub_Basement {
+		biome_weight += info.w
+	}
+	if info.b2 == .Warehouse || info.b2 == .Parking_Garage || info.b2 == .Sub_Basement {
+		biome_weight += 1 - info.w
+	}
+	if biome_weight <= 0 do return 0
+	// Broad, smoothly blended bowls. Thresholding creates separated valley patches.
+	n := bfbm_for_floor(f32(x) * 0.035, f32(z) * 0.035, 811, current_floor, current_level)
+	t := clamp((n - 0.56) / 0.34, 0, 1)
+	t = t * t * (3 - 2 * t)
+	// Depth is low-frequency continuous noise too; hashing 12-cell blocks here
+	// would introduce visible cliffs along the valley floor.
+	depth_noise := bfbm_for_floor(
+		f32(x) * 0.012,
+		f32(z) * 0.012,
+		813,
+		current_floor,
+		current_level,
+	)
+	depth := 1.0 + 2.0 * depth_noise
+	return -depth * t * biome_weight * spawn_fade
 }
 
-// NEW: continuous ground at a world position, including stair ramps and shafts.
-ground_at :: proc(wx, wz: f32) -> f32 {
+floor_h :: proc(x, z: i32) -> f32 {
+	if abs(x) <= SPAWN_CLEAR && abs(z) <= SPAWN_CLEAR do return 0
+	r := region_at(x, z)
+	i := region_idx(r, x, z)
+	if r.cell_flg[i] & CELL_LINK != 0 do return 0
+	return f32(r.cell_floor[i]) * FLOOR_STEP + valley_depth(x, z)
+}
+
+floor_corner_h :: proc(cx, cz: i32) -> f32 {
+	return(
+		(floor_h(cx - 1, cz - 1) + floor_h(cx, cz - 1) + floor_h(cx - 1, cz) + floor_h(cx, cz)) *
+		0.25 \
+	)
+}
+
+link_progress :: proc(l: Vertical_Link, wx, wz: f32) -> f32 {
+	x0, z0 := f32(l.x) * CELL, f32(l.z) * CELL
+	lx := clamp((wx - x0) / (f32(l.w) * CELL), 0, 1)
+	lz := clamp((wz - z0) / (f32(l.d) * CELL), 0, 1)
+	if l.kind == .Switchback {
+		// Two parallel lanes joined at their far end create a U-shaped run.
+		across, along := lx, 1 - lz
+		if l.direction == 1 {along = lz}
+		if l.direction == 2 {across, along = 1 - lz, lx}
+		if l.direction == 3 {across, along = lz, 1 - lx}
+		run := l.d if l.direction < 2 else l.w
+		turn_start := 1.0 - 1.0 / f32(max(run, 2))
+		if along >= turn_start do return 0.5
+		u := clamp(along / turn_start, 0, 1)
+		if across < 0.5 {return u * 0.5}
+		return 0.5 + (1 - u) * 0.5
+	}
+	switch l.direction {
+	case 0:
+		return 1 - lz
+	case 1:
+		return lz
+	case 2:
+		return lx
+	case 3:
+		return 1 - lx
+	}
+	return 0
+}
+
+link_surface_local :: proc(l: Vertical_Link, role: Link_Role, wx, wz: f32) -> f32 {
+	if role == .Lower {
+		if l.kind == .Drop || l.kind == .Slide do return 0
+		t := link_progress(l, wx, wz)
+		if l.kind == .Stairs || l.kind == .Switchback {
+			run := l.d if l.direction < 2 else l.w
+			if l.kind == .Switchback do run *= 2
+			steps := max(1, run * STAIR_STEPS)
+			t = f32(i32(math.floor(t * f32(steps)))) / f32(steps)
+		}
+		return FLOOR_SPACING * t
+	}
+	if role != .Upper do return 0
+	if l.kind == .Drop do return -FLOOR_SPACING
+	t := link_progress(l, wx, wz)
+	if l.kind == .Stairs || l.kind == .Switchback {
+		run := l.d if l.direction < 2 else l.w
+		if l.kind == .Switchback do run *= 2
+		steps := max(1, run * STAIR_STEPS)
+		t = f32(i32(math.floor(t * f32(steps)))) / f32(steps)
+	}
+	return FLOOR_SPACING * (t - 1)
+}
+
+vertical_link_at :: proc(wx, wz: i32) -> (link: Vertical_Link, ok: bool, role: Link_Role) {
+	r := region_at(wx, wz)
+	i := region_idx(r, wx, wz)
+	id := r.cell_link_id[i]
+	if id < 0 || int(id) >= r.link_count do return {}, false, .None
+	return r.links[id], true, Link_Role(r.cell_link_role[i])
+}
+
+link_local_feet :: proc(wx, wz: f32) -> (bool, Vertical_Link, Link_Role, f32) {
+	cx, cz := i32(math.floor(wx / CELL)), i32(math.floor(wz / CELL))
+	l, ok, role := vertical_link_at(cx, cz)
+	if !ok do return false, {}, .None, 0
+	return true, l, role, link_surface_local(l, role, wx, wz)
+}
+
+ground_local_at :: proc(wx, wz: f32) -> f32 {
 	cx := i32(math.floor(wx / CELL))
 	cz := i32(math.floor(wz / CELL))
-	if abs(cx) <= SPAWN_CLEAR && abs(cz) <= SPAWN_CLEAR do return 0
-
-	r := region_at(cx, cz)
-	i := region_idx(r, cx, cz)
-	flag := r.cell_flg[i]
-	base := f32(r.cell_floor[i]) * FLOOR_STEP
-
-	// Hole: return a very deep "ground" so the player falls
-	if flag & CELL_HOLE != 0 do return base - HOLE_DEPTH - 5.0
-
-	// Stair: ramp, snapped to the nearest discrete tread
-	if flag & CELL_STAIR != 0 {
-		d := r.cell_stair[i]
-		lx := (wx - f32(cx) * CELL) / CELL
-		lz := (wz - f32(cz) * CELL) / CELL
-		t: f32
-		switch d {
-		case 0:
-			t = 1 - lz // ascends north
-		case 1:
-			t = lz // ascends south
-		case 2:
-			t = lx // ascends east
-		case 3:
-			t = 1 - lx // ascends west
-		}
-		step_idx := clamp(i32(math.floor(t * f32(STAIR_STEPS))), 0, STAIR_STEPS - 1)
-		return base + STAIR_RISE * (f32(step_idx) + 0.5) / f32(STAIR_STEPS)
+	if on_link, _, _, h := link_local_feet(wx, wz); on_link {
+		return h
 	}
+	if abs(cx) <= SPAWN_CLEAR && abs(cz) <= SPAWN_CLEAR do return 0
+	// Bilinear interpolation of the shared corner heightfield keeps valleys smooth.
+	x0, z0 := f32(cx) * CELL, f32(cz) * CELL
+	u := clamp((wx - x0) / CELL, 0, 1)
+	v := clamp((wz - z0) / CELL, 0, 1)
+	nw := floor_corner_h(cx, cz)
+	ne := floor_corner_h(cx + 1, cz)
+	se := floor_corner_h(cx + 1, cz + 1)
+	sw := floor_corner_h(cx, cz + 1)
+	return bilerp4(nw, ne, se, sw, u, v)
+}
 
-	return base
+ground_at :: proc(wx, wz: f32) -> f32 {
+	return floor_world_offset(current_floor) + ground_local_at(wx, wz)
 }
 
 // ───────────────────────── lights ─────────────────────────
@@ -803,6 +1150,7 @@ LIGHT_SPACING := [Biome_Type][2]i32 {
 }
 
 light_power :: proc(x, z: i32) -> f32 {
+	if _, has_link, _ := vertical_link_at(x, z); has_link do return 0
 	sp := LIGHT_SPACING[biome_at(x, z)]
 	if x %% sp.x != 0 || z %% sp.y != 0 do return 0
 	if pillar_at(x, z) do return 0
@@ -824,4 +1172,3 @@ light_color :: proc(x, z: i32) -> rl.Color {
 	}
 	return rl.Color{255, 245, 220, 255}
 }
-

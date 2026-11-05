@@ -15,19 +15,21 @@ Player :: struct {
 	pending:                          i32, // 0=none, +1=up, -1=down
 	pending_cx, pending_cz:           i32,
 	fade:                             f32, // 0=transparent, 1=black
+	transition_waiting:               bool, // hold black until the new floor's player chunk is uploaded
 	grace:                            f32, // seconds until next transition allowed
 }
 
 player_init :: proc() -> Player {
 	return Player {
 		cam = {
-			position = {CELL / 2, EYE_H, CELL / 2},
-			target = {CELL / 2, EYE_H, CELL / 2 + 1},
+			position = {CELL / 2, floor_world_offset(current_floor) + EYE_H, CELL / 2},
+			target = {CELL / 2, floor_world_offset(current_floor) + EYE_H, CELL / 2 + 1},
 			up = {0, 1, 0},
 			fovy = 60,
 			projection = .PERSPECTIVE,
 		},
-		eye_y = EYE_H,
+		eye_y = floor_world_offset(current_floor) + EYE_H,
+		feet_y = floor_world_offset(current_floor),
 		grounded = true,
 		warmup = 10,
 	}
@@ -50,17 +52,6 @@ step_rand :: proc(n: i32, seed: u32) -> f32 {
 
 cell_of :: proc(w: f32) -> i32 {return i32(math.floor(w / CELL))}
 
-// NEW: find a safe landing cell (no hole, stair, or pillar) near a target.
-safe_landing :: proc(cx, cz: i32) -> (i32, i32) {
-	if !hole_at(cx, cz) && !stair_at(cx, cz) && !pillar_at(cx, cz) do return cx, cz
-	for o in ([8][2]i32{{1, 0}, {-1, 0}, {0, 1}, {0, -1}, {1, 1}, {1, -1}, {-1, 1}, {-1, -1}}) {
-		nx, nz := cx + o[0], cz + o[1]
-		if hole_at(nx, nz) || stair_at(nx, nz) || pillar_at(nx, nz) do continue
-		return nx, nz
-	}
-	return cx, cz
-}
-
 player_update :: proc(p: ^Player, dt: f32) {
 	// ── look ──
 	md := rl.GetMouseDelta()
@@ -79,9 +70,30 @@ player_update :: proc(p: ^Player, dt: f32) {
 	if rl.IsKeyDown(.D) do dir += right
 	if rl.IsKeyDown(.A) do dir -= right
 	if l := math.sqrt(dir.x * dir.x + dir.z * dir.z); l > 0 do dir /= l
+	// Keep the player inside the seam trigger while the fade performs the floor swap.
+	if p.pending != 0 || p.transition_waiting do dir = {}
+
+	// A slide chute applies a persistent downhill pull while the player is inside it.
+	cx_now, cz_now := cell_of(p.cam.position.x), cell_of(p.cam.position.z)
+	if link, ok, role := vertical_link_at(cx_now, cz_now);
+	   ok && role == .Upper && link.kind == .Slide {
+		downhill: rl.Vector3
+		switch link.direction {
+		case 0: downhill = {0, 0, 1}
+		case 1: downhill = {0, 0, -1}
+		case 2: downhill = {-1, 0, 0}
+		case 3: downhill = {1, 0, 0}
+		}
+		dir += downhill * 1.35
+		if l := math.sqrt(dir.x * dir.x + dir.z * dir.z); l > 0 do dir /= l
+	}
 
 	sprint := rl.IsKeyDown(.LEFT_SHIFT) && rl.IsKeyDown(.W)
 	speed := f32(MOVE_SPEED) * (sprint ? 1.7 : 1.0)
+	if link, ok, role := vertical_link_at(cx_now, cz_now); ok && role == .Upper && link.kind == .Slide {
+		speed *= 1.65
+	}
+	if p.pending != 0 || p.transition_waiting do speed = 0
 	old_pos := p.cam.position
 
 	proposed := rl.Vector2 {
@@ -133,66 +145,53 @@ player_update :: proc(p: ^Player, dt: f32) {
 		p.grounded = false
 	}
 
-	// ── NEW: transition triggers ──
+	// ── Shared vertical-link transitions ──
+	local_feet := p.feet_y - floor_world_offset(current_floor)
 	if p.grace <= 0 && p.pending == 0 {
-		// UP: standing on the top tread of a stairwell
-		if stair_at(p.cell_x, p.cell_z) {
-			base := floor_h(p.cell_x, p.cell_z)
-			if p.feet_y - base > STAIR_RISE * 0.85 {
+		if link, ok, role := vertical_link_at(p.cell_x, p.cell_z); ok {
+			t := link_progress(link, p.cam.position.x, p.cam.position.z)
+			walkable_link := link.kind == .Stairs || link.kind == .Switchback || link.kind == .Ramp
+			if role == .Lower && walkable_link && t >= 0.92 && local_feet >= FLOOR_SPACING - 0.8 {
 				p.pending = 1
-				p.pending_cx = p.cell_x
-				p.pending_cz = p.cell_z
-			}
-		}
-		// DOWN: fallen into a shaft
-		if hole_at(p.cell_x, p.cell_z) {
-			base := floor_h(p.cell_x, p.cell_z)
-			if p.feet_y < base - 1.0 {
-				p.pending = -1
-				p.pending_cx = p.cell_x
-				p.pending_cz = p.cell_z
+				p.pending_cx, p.pending_cz = p.cell_x, p.cell_z
+			} else if role == .Upper {
+				// A drop transitions from anywhere over its atrium floor. Stairs,
+				// Ramps and slides transition at the lower end of their run.
+				if (link.kind == .Drop && local_feet <= -FLOOR_SPACING + 0.65) ||
+				   ((link.kind != .Drop) && t <= 0.08 && local_feet <= -FLOOR_SPACING + 0.8) {
+					p.pending = -1
+					p.pending_cx, p.pending_cz = p.cell_x, p.cell_z
+				}
 			}
 		}
 	}
 
-	// Cancel if the player moved away from the trigger
-	if p.pending == 1 {
-		if p.cell_x != p.pending_cx ||
-		   p.cell_z != p.pending_cz ||
-		   p.feet_y - floor_h(p.cell_x, p.cell_z) < STAIR_RISE * 0.8 {
+	// Cancel a transition only if the player leaves its link footprint.
+	if p.pending != 0 {
+		if _, ok, role := vertical_link_at(p.cell_x, p.cell_z); !ok {
 			p.pending = 0
-		}
-	}
-	if p.pending == -1 {
-		if p.cell_x != p.pending_cx ||
-		   p.cell_z != p.pending_cz ||
-		   p.feet_y > floor_h(p.cell_x, p.cell_z) - 0.8 {
+		} else if p.pending > 0 && role != .Lower {
+			p.pending = 0
+		} else if p.pending < 0 && role != .Upper {
 			p.pending = 0
 		}
 	}
 
-	// Fade: ramp up while pending, then commit at the darkest point
+	// Fade hides the floor-index switch; world-space Y remains continuous because
+	// the new floor's local geometry is translated by exactly six metres.
 	if p.pending != 0 {
 		p.fade = min(1.0, p.fade + dt * 6.0)
 		if p.fade >= 0.95 {
-			// Commit the transition
-			dir_lvl := p.pending
-			ox, oz := p.pending_cx, p.pending_cz
+			dir_floor := p.pending
 			p.pending = 0
 			p.fade = 1.0
-			set_level(current_level + dir_lvl)
-			nx, nz := safe_landing(ox, oz)
-			p.cam.position.x = (f32(nx) + 0.5) * CELL
-			p.cam.position.z = (f32(nz) + 0.5) * CELL
-			p.feet_y = floor_h(nx, nz)
+			p.transition_waiting = true
+			set_current_floor(current_floor + dir_floor)
 			p.vel_y = 0
 			p.grounded = true
-			p.eye_y = p.feet_y + EYE_H
-			p.cell_x = nx
-			p.cell_z = nz
 			p.grace = 0.5
 		}
-	} else {
+	} else if !p.transition_waiting {
 		p.fade = max(0.0, p.fade - dt * 4.0)
 	}
 	if p.grace > 0 do p.grace -= dt

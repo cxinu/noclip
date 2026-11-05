@@ -36,6 +36,19 @@ main :: proc() {
 			devmap_draw(&d, p.cam.position, p.yaw)
 		} else {
 			world_update(&w, p.cam.position)
+			// Keep the floor-transition fade black until the new player chunk is
+			// actually uploaded; time-sliced generation can take several frames.
+			if p.transition_waiting {
+				player_chunk := Chunk_Coord{
+					i32(math.floor(p.cam.position.x / CHUNK_W)),
+					i32(math.floor(p.cam.position.z / CHUNK_W)),
+				}
+				if player_chunk in w.chunks {
+					p.transition_waiting = false
+				} else {
+					p.fade = 1.0
+				}
+			}
 			cell_x := i32(math.floor(p.cam.position.x / CELL))
 			cell_z := i32(math.floor(p.cam.position.z / CELL))
 			regions_trim(cell_x, cell_z)
