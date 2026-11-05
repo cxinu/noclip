@@ -11,15 +11,13 @@ Player :: struct {
 	grounded:                         bool,
 	warmup:                           int,
 	cell_x, cell_z:                   i32,
-	// NEW: level-transition state
-	pending:                          i32, // 0=none, +1=up, -1=down
-	pending_cx, pending_cz:           i32,
-	fade:                             f32, // 0=transparent, 1=black
-	transition_waiting:               bool, // hold black until the new floor's player chunk is uploaded
-	grace:                            f32, // seconds until next transition allowed
+	// Debounce only prevents a seam crossing from being counted twice. The
+	// player's world-space position is never reset or hidden during traversal.
+	grace:                            f32,
 }
 
 player_init :: proc() -> Player {
+	set_current_floor(current_floor)
 	return Player {
 		cam = {
 			position = {CELL / 2, floor_world_offset(current_floor) + EYE_H, CELL / 2},
@@ -70,9 +68,6 @@ player_update :: proc(p: ^Player, dt: f32) {
 	if rl.IsKeyDown(.D) do dir += right
 	if rl.IsKeyDown(.A) do dir -= right
 	if l := math.sqrt(dir.x * dir.x + dir.z * dir.z); l > 0 do dir /= l
-	// Keep the player inside the seam trigger while the fade performs the floor swap.
-	if p.pending != 0 || p.transition_waiting do dir = {}
-
 	// A slide chute applies a persistent downhill pull while the player is inside it.
 	cx_now, cz_now := cell_of(p.cam.position.x), cell_of(p.cam.position.z)
 	if link, ok, role := vertical_link_at(cx_now, cz_now);
@@ -93,7 +88,6 @@ player_update :: proc(p: ^Player, dt: f32) {
 	if link, ok, role := vertical_link_at(cx_now, cz_now); ok && role == .Upper && link.kind == .Slide {
 		speed *= 1.65
 	}
-	if p.pending != 0 || p.transition_waiting do speed = 0
 	old_pos := p.cam.position
 
 	proposed := rl.Vector2 {
@@ -115,7 +109,15 @@ player_update :: proc(p: ^Player, dt: f32) {
 			proposed = {p.cam.position.x, p.cam.position.z}
 		}
 	}
-	fixed := collide_walls(proposed, PLAYER_R)
+	fixed := collide_walls(proposed, PLAYER_R, p.feet_y, PLAYER_COLLISION_H)
+	fixed = collide_link_sides(fixed, PLAYER_R, p.feet_y, PLAYER_COLLISION_H)
+	fixed = collide_link_underside_horizontal(
+		fixed,
+		{old_pos.x, old_pos.z},
+		PLAYER_R,
+		p.feet_y,
+		PLAYER_COLLISION_H,
+	)
 	p.cam.position.x, p.cam.position.z = fixed.x, fixed.y
 	p.cell_x = cell_of(p.cam.position.x)
 	p.cell_z = cell_of(p.cam.position.z)
@@ -124,12 +126,22 @@ player_update :: proc(p: ^Player, dt: f32) {
 	ground := ground_at(p.cam.position.x, p.cam.position.z)
 	was_grounded := p.grounded
 
+	previous_feet_y := p.feet_y
 	if p.grounded && rl.IsKeyPressed(.SPACE) {
 		p.vel_y = JUMP_V
 		p.grounded = false
 	}
 	p.vel_y -= GRAVITY * dt
 	p.feet_y += p.vel_y * dt
+	p.feet_y, p.vel_y = resolve_link_underside_vertical(
+		p.cam.position.x,
+		p.cam.position.z,
+		previous_feet_y,
+		p.feet_y,
+		p.vel_y,
+		PLAYER_COLLISION_H,
+		PLAYER_R,
+	)
 
 	if p.feet_y <= ground {
 		if !was_grounded && p.vel_y < -2 {
@@ -145,56 +157,37 @@ player_update :: proc(p: ^Player, dt: f32) {
 		p.grounded = false
 	}
 
-	// ── Shared vertical-link transitions ──
-	local_feet := p.feet_y - floor_world_offset(current_floor)
-	if p.grace <= 0 && p.pending == 0 {
+	// ── Continuous vertical traversal ──
+	// A link's lower and upper meshes describe the same world-space stair/ramp
+	// surface. We change only the query/storey context at its endpoint; the
+	// camera, feet and velocity remain in absolute world coordinates.
+	if p.grace <= 0 {
 		if link, ok, role := vertical_link_at(p.cell_x, p.cell_z); ok {
 			t := link_progress(link, p.cam.position.x, p.cam.position.z)
-			walkable_link := link.kind == .Stairs || link.kind == .Switchback || link.kind == .Ramp
-			if role == .Lower && walkable_link && t >= 0.92 && local_feet >= FLOOR_SPACING - 0.8 {
-				p.pending = 1
-				p.pending_cx, p.pending_cz = p.cell_x, p.cell_z
-			} else if role == .Upper {
-				// A drop transitions from anywhere over its atrium floor. Stairs,
-				// Ramps and slides transition at the lower end of their run.
-				if (link.kind == .Drop && local_feet <= -FLOOR_SPACING + 0.65) ||
-				   ((link.kind != .Drop) && t <= 0.08 && local_feet <= -FLOOR_SPACING + 0.8) {
-					p.pending = -1
-					p.pending_cx, p.pending_cz = p.cell_x, p.cell_z
+			base_y := floor_world_offset(current_floor)
+			walkable := link.kind == .Stairs || link.kind == .Switchback || link.kind == .Ramp
+
+			if role == .Lower && walkable && current_floor < WORLD_FLOOR_COUNT - 1 {
+				at_upper_end := t >= 0.96 && p.feet_y >= base_y + FLOOR_SPACING - 0.45
+				if at_upper_end {
+					set_current_floor(current_floor + 1)
+					p.grace = 0.20
+				}
+			} else if role == .Upper && current_floor > 0 {
+				at_lower_end := false
+				if link.kind == .Drop {
+					at_lower_end = p.grounded && p.feet_y <= base_y - FLOOR_SPACING + 0.30
+				} else {
+					at_lower_end = t <= 0.04 && p.feet_y <= base_y - FLOOR_SPACING + 0.45
+				}
+				if at_lower_end {
+					set_current_floor(current_floor - 1)
+					p.grace = 0.20
 				}
 			}
 		}
 	}
-
-	// Cancel a transition only if the player leaves its link footprint.
-	if p.pending != 0 {
-		if _, ok, role := vertical_link_at(p.cell_x, p.cell_z); !ok {
-			p.pending = 0
-		} else if p.pending > 0 && role != .Lower {
-			p.pending = 0
-		} else if p.pending < 0 && role != .Upper {
-			p.pending = 0
-		}
-	}
-
-	// Fade hides the floor-index switch; world-space Y remains continuous because
-	// the new floor's local geometry is translated by exactly six metres.
-	if p.pending != 0 {
-		p.fade = min(1.0, p.fade + dt * 6.0)
-		if p.fade >= 0.95 {
-			dir_floor := p.pending
-			p.pending = 0
-			p.fade = 1.0
-			p.transition_waiting = true
-			set_current_floor(current_floor + dir_floor)
-			p.vel_y = 0
-			p.grounded = true
-			p.grace = 0.5
-		}
-	} else if !p.transition_waiting {
-		p.fade = max(0.0, p.fade - dt * 4.0)
-	}
-	if p.grace > 0 do p.grace -= dt
+	if p.grace > 0 do p.grace = max(0, p.grace - dt)
 
 	// ── POV mechanics (unchanged) ──
 	moved := math.sqrt(

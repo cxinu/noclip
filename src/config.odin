@@ -28,6 +28,7 @@ SHADER_BLOOM_FS :: "assets/shaders/bloom.fs"
 // player
 EYE_H :: 1.3
 PLAYER_R :: 0.5
+PLAYER_COLLISION_H :: 1.75
 GRAVITY :: 26.0
 JUMP_V :: 8.5
 MOVE_SPEED :: 4.0

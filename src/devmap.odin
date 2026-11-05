@@ -57,6 +57,7 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		} else {rl.DisableCursor()}
 	}
 	if !m.open do return
+	m.view_level = clamp(m.view_level, 0, WORLD_FLOOR_COUNT - 1)
 
 	m.zoom = clamp(m.zoom * (1 + rl.GetMouseWheelMove() * 0.1), 4, 40)
 	if rl.IsMouseButtonDown(.RIGHT) {
@@ -68,10 +69,10 @@ devmap_update :: proc(m: ^Dev_Map, player: ^Player) {
 		.C,
 	) {m.cx, m.cz = player.cam.position.x / CELL, player.cam.position.z / CELL}
 	if rl.IsKeyPressed(.RIGHT_BRACKET) || rl.IsKeyPressed(.PAGE_UP) {
-		m.view_level += 1
+		m.view_level = min(m.view_level + 1, WORLD_FLOOR_COUNT - 1)
 	}
 	if rl.IsKeyPressed(.LEFT_BRACKET) || rl.IsKeyPressed(.PAGE_DOWN) {
-		m.view_level -= 1
+		m.view_level = max(m.view_level - 1, 0)
 	}
 	if rl.IsKeyPressed(.ENTER) {
 		set_current_floor(m.view_level)
@@ -136,12 +137,13 @@ tint_by_floor :: proc(c: rl.Color, lvl: i8) -> rl.Color {
 }
 
 devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
-	player_floor := current_floor
-	current_floor = m.view_level
-	last_region = nil
+	player_floor, player_level := current_floor, current_level
+	current_floor = clamp(m.view_level, 0, WORLD_FLOOR_COUNT - 1)
+	current_level = current_floor
+	region_cache_clear()
 	defer {
-		current_floor = player_floor
-		last_region = nil
+		current_floor, current_level = player_floor, player_level
+		region_cache_clear()
 	}
 
 	rl.BeginDrawing()
@@ -292,7 +294,7 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 		fmt.ctprintf(
 			"viewing floor %d: %s%s",
 			m.view_level,
-			LEVELS[current_level].name,
+			LEVELS[m.view_level].name,
 			" (you are here)" if player_floor == m.view_level else "",
 		),
 		10,
@@ -302,7 +304,7 @@ devmap_draw :: proc(m: ^Dev_Map, pos: rl.Vector3, yaw: f32) {
 	)
 	if player_floor != m.view_level {
 		rl.DrawText(
-			fmt.ctprintf("you are on floor %d: %s", player_floor, LEVELS[current_level].name),
+			fmt.ctprintf("you are on floor %d: %s", player_floor, LEVELS[player_floor].name),
 			10,
 			68,
 			10,

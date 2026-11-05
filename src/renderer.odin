@@ -93,9 +93,7 @@ renderer_destroy :: proc(r: ^Renderer) {
 	rl.UnloadRenderTexture(r.bloom_target)
 }
 
-// fade: 0.0 = fully visible, 1.0 = fully black. Drawn on top of everything so
-// level transitions are hidden without the shader chain quantizing the fade.
-renderer_present :: proc(r: ^Renderer, fade: f32 = 0) {
+renderer_present :: proc(r: ^Renderer) {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.BLACK)
 
@@ -125,13 +123,6 @@ renderer_present :: proc(r: ^Renderer, fade: f32 = 0) {
 	rl.BeginShaderMode(r.post)
 	rl.DrawTexturePro(r.target.texture, src, renderer_viewport(), {0, 0}, 0, rl.WHITE)
 	rl.EndShaderMode()
-
-	// 3. Fade overlay — outside the shader, so it's pure black over the
-	//    full window (letterbox + viewport), not quantized/dithered.
-	if fade > 0 {
-		a := u8(clamp(fade, 0, 1) * 255 + 0.5)
-		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), {0, 0, 0, a})
-	}
 
 	rl.EndDrawing()
 }
