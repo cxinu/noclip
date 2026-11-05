@@ -1,13 +1,42 @@
 package main
 
 import "core:math"
+import "core:time"
 import rl "vendor:raylib"
 import "vendor:raylib/rlgl"
+
+Verts :: struct {
+	pos: [dynamic]f32,
+	col: [dynamic]u8,
+}
+
+Chunk_Build_Stage :: enum {
+	Idle,
+	Light_Cache,
+	Geometry,
+	Upload,
+}
+
+Chunk_Builder :: struct {
+	active:      bool,
+	coord:       Chunk_Coord,
+	level:       i32,
+	stage:       Chunk_Build_Stage,
+	cache_index: int,
+	cell_index:  int,
+	verts:       Verts,
+}
 
 World :: struct {
 	chunks:   map[Chunk_Coord]rl.Mesh,
 	material: rl.Material,
+	builder:  Chunk_Builder,
+	level:    i32,
 }
+
+// CPU generation is time-sliced. A single cell is the smallest indivisible unit.
+CHUNK_BUILD_BUDGET_US :: f64(1500.0)
+PLAYER_CHUNK_BUDGET_US :: f64(3500.0)
 
 west_wall_height :: proc(x, z: i32) -> f32 {return max(corner_h(x, z), corner_h(x, z + 1)) + 0.05}
 north_wall_height :: proc(x, z: i32) -> f32 {return max(corner_h(x, z), corner_h(x + 1, z)) + 0.05}
@@ -127,55 +156,136 @@ shade :: proc(c: rl.Color, k: i32) -> rl.Color {
 
 world_init :: proc(shader: rl.Shader) -> World {
 	w: World
+	w.chunks = make(map[Chunk_Coord]rl.Mesh)
 	w.material = rl.LoadMaterialDefault()
 	w.material.shader = shader
+	w.level = current_level
 	return w
 }
 
+chunk_builder_cancel :: proc(b: ^Chunk_Builder) {
+	delete(b.verts.pos)
+	delete(b.verts.col)
+	b^ = Chunk_Builder{}
+}
+
 world_destroy :: proc(w: ^World) {
-	for _, m in w.chunks do rl.UnloadMesh(m)
+	chunk_builder_cancel(&w.builder)
+	for _, m in w.chunks {
+		rl.UnloadMesh(m)
+	}
 	delete(w.chunks)
 }
 
 world_update :: proc(w: ^World, pos: rl.Vector3) {
 	pc := Chunk_Coord{i32(math.floor(pos.x / CHUNK_W)), i32(math.floor(pos.z / CHUNK_W))}
-	if pc not_in w.chunks do w.chunks[pc] = build_chunk(pc)
 
-	// Build the closest missing neighbour first. The old nested-loop order
-	// could spend a frame generating a farther diagonal chunk while a nearer
-	// chunk was still missing.
-	best_chunk: Chunk_Coord
-	best_distance: i32 = 0x7fffffff
-	has_missing := false
-	for dz in -VIEW_RADIUS ..= VIEW_RADIUS do for dx in -VIEW_RADIUS ..= VIEW_RADIUS {
-		c := pc + {i32(dx), i32(dz)}
-		if c in w.chunks do continue
-		distance := i32(dx * dx + dz * dz)
-		if !has_missing || distance < best_distance {
-			best_chunk = c
-			best_distance = distance
-			has_missing = true
+	// A level transition invalidates both finished meshes and pending CPU work.
+	if w.level != current_level {
+		chunk_builder_cancel(&w.builder)
+		for _, m in w.chunks {
+			rl.UnloadMesh(m)
+		}
+		delete(w.chunks)
+		w.chunks = make(map[Chunk_Coord]rl.Mesh)
+		w.level = current_level
+	}
+
+	uploaded_this_frame := false
+
+	// Preempt a neighbour job if the player's current chunk is still missing.
+	if w.builder.active {
+		outside :=
+			(abs(w.builder.coord.x - pc.x) > VIEW_RADIUS + 1 ||
+				abs(w.builder.coord.y - pc.y) > VIEW_RADIUS + 1)
+		is_player_chunk := w.builder.coord.x == pc.x && w.builder.coord.y == pc.y
+		player_chunk_missing := pc not_in w.chunks
+
+		if outside ||
+		   (player_chunk_missing && !is_player_chunk) ||
+		   w.builder.level != current_level {
+			chunk_builder_cancel(&w.builder)
 		}
 	}
-	if has_missing do w.chunks[best_chunk] = build_chunk(best_chunk)
 
-	stale := make([dynamic]Chunk_Coord, context.temp_allocator)
-	for c in w.chunks {
-		if abs(c.x - pc.x) > VIEW_RADIUS + 1 || abs(c.y - pc.y) > VIEW_RADIUS + 1 do append(&stale, c)
+	// Upload only a completed mesh, and give that upload its own update frame.
+	if w.builder.active && w.builder.stage == .Upload {
+		completed_coord := w.builder.coord
+		completed_mesh := chunk_builder_upload(&w.builder)
+		w.chunks[completed_coord] = completed_mesh
+		chunk_builder_cancel(&w.builder)
+		uploaded_this_frame = true
 	}
-	for c in stale {rl.UnloadMesh(w.chunks[c]); delete_key(&w.chunks, c)}
 
+	// Start one job at a time. The player's chunk takes priority.
+	if !w.builder.active && !uploaded_this_frame {
+		target := pc
+		has_target := pc not_in w.chunks
+
+		if !has_target {
+			best_distance: i32 = 0x7fffffff
+			for dz in -VIEW_RADIUS ..= VIEW_RADIUS {
+				for dx in -VIEW_RADIUS ..= VIEW_RADIUS {
+					c := pc + {i32(dx), i32(dz)}
+					if c in w.chunks do continue
+					distance := i32(dx * dx + dz * dz)
+					if !has_target || distance < best_distance {
+						target = c
+						best_distance = distance
+						has_target = true
+					}
+				}
+			}
+		}
+
+		if has_target {
+			chunk_builder_begin(&w.builder, target)
+		}
+	}
+
+	// Do bounded CPU work. Each cache cell or world cell is atomic, so a single
+	// expensive cell can exceed the budget slightly, but work resumes next frame.
+	if w.builder.active && !uploaded_this_frame && w.builder.stage != .Upload {
+		budget_us := CHUNK_BUILD_BUDGET_US
+		if w.builder.coord.x == pc.x && w.builder.coord.y == pc.y {
+			budget_us = PLAYER_CHUNK_BUDGET_US
+		}
+
+		start_tick := time.tick_now()
+		did_work := false
+
+		for w.builder.stage != .Upload {
+			elapsed_us := time.duration_microseconds(time.tick_since(start_tick))
+			if did_work && elapsed_us >= budget_us do break
+			chunk_builder_step(&w.builder)
+			did_work = true
+		}
+	}
+
+	// Unload at most one stale mesh in a frame. Do not combine it with a GPU upload.
+	if !uploaded_this_frame {
+		stale: Chunk_Coord
+		has_stale := false
+
+		for c in w.chunks {
+			if abs(c.x - pc.x) > VIEW_RADIUS + 1 || abs(c.y - pc.y) > VIEW_RADIUS + 1 {
+				stale = c
+				has_stale = true
+				break
+			}
+		}
+
+		if has_stale {
+			rl.UnloadMesh(w.chunks[stale])
+			delete_key(&w.chunks, stale)
+		}
+	}
 }
 
 world_draw :: proc(w: ^World) {
 	rlgl.DisableBackfaceCulling()
 	for _, m in w.chunks do rl.DrawMesh(m, w.material, rl.Matrix(1))
 	rlgl.EnableBackfaceCulling()
-}
-
-Verts :: struct {
-	pos: [dynamic]f32,
-	col: [dynamic]u8,
 }
 
 quad :: proc(v: ^Verts, a, b, c, d: [3]f32, col: rl.Color) {
@@ -204,8 +314,8 @@ quad_colored :: proc(
 	}
 }
 
-LIGHT_STEP :: 1.0
-FLAT_STEP :: 1.0
+LIGHT_STEP :: 1
+FLAT_STEP :: 1
 Z_FACE_K :: 0.93
 WALL_EPS :: 0.08
 STEP_EPS :: 0.03
@@ -248,6 +358,62 @@ linalg_len :: proc(p: [3]f32) -> f32 {return math.sqrt(p.x * p.x + p.y * p.y + p
 
 flat_lit :: proc(v: ^Verts, a, b, c, d: [3]f32, col: rl.Color) {
 	lit_quad(v, a, b, c, d, col, 1.0, FLAT_STEP, {true, true})
+}
+
+
+chunk_builder_begin :: proc(b: ^Chunk_Builder, c: Chunk_Coord) {
+	chunk_builder_cancel(b)
+	b.active = true
+	b.coord = c
+	b.level = current_level
+	b.stage = .Light_Cache
+	b.cache_index = 0
+	b.cell_index = 0
+	light_grid_begin(c)
+}
+
+chunk_builder_step :: proc(b: ^Chunk_Builder) {
+	switch b.stage {
+	case .Light_Cache:
+		i := b.cache_index % LIGHT_GRID_N
+		j := b.cache_index / LIGHT_GRID_N
+		light_grid_fill_cell(i, j)
+		b.cache_index += 1
+		if b.cache_index >= LIGHT_GRID_N * LIGHT_GRID_N {
+			b.stage = .Geometry
+		}
+
+	case .Geometry:
+		x := i32(b.cell_index % int(CHUNK_SIZE))
+		z := i32(b.cell_index / int(CHUNK_SIZE))
+		build_chunk_cell(&b.verts, b.coord, x, z)
+		b.cell_index += 1
+		if b.cell_index >= int(CHUNK_SIZE * CHUNK_SIZE) {
+			b.stage = .Upload
+		}
+
+	case .Idle, .Upload:
+	// Nothing to do in these stages.
+	}
+}
+
+chunk_builder_upload :: proc(b: ^Chunk_Builder) -> rl.Mesh {
+	v := &b.verts
+	n := len(v.col) / 4
+	m := rl.Mesh {
+		vertexCount   = i32(n),
+		triangleCount = i32(n / 3),
+	}
+
+	if n > 0 {
+		m.vertices = cast([^]f32)rl.MemAlloc(u32(len(v.pos) * size_of(f32)))
+		m.colors = cast([^]u8)rl.MemAlloc(u32(len(v.col)))
+		copy(m.vertices[:len(v.pos)], v.pos[:])
+		copy(m.colors[:len(v.col)], v.col[:])
+		rl.UploadMesh(&m, false)
+	}
+
+	return m
 }
 
 emit_wall :: proc(
@@ -459,95 +625,98 @@ emit_step_n :: proc(v: ^Verts, wx, wz: i32) {
 	lit_quad(v, {x0, y_lo, z0}, {x1, y_lo, z0}, {x1, y_hi, z0}, {x0, y_hi, z0}, col)
 }
 
+// Emit geometry for exactly one world cell. The resumable builder calls this
+// after the complete lighting cache for the target chunk has been prepared.
+build_chunk_cell :: proc(v: ^Verts, c: Chunk_Coord, x, z: i32) {
+	wx, wz := c.x * CHUNK_SIZE + x, c.y * CHUNK_SIZE + z
+	x0, z0 := f32(wx) * CELL, f32(wz) * CELL
+	x1, z1 := x0 + CELL, z0 + CELL
+	light_center = {x0 + CELL * 0.5, z0 + CELL * 0.5}
+
+	biome := biome_at(wx, wz)
+	pal := PALETTES[biome]
+	k := i32((raw_hash(wx, wz) >> 4) % 3) * 8 - 8
+
+	h_nw := corner_h(wx, wz)
+	h_ne := corner_h(wx + 1, wz)
+	h_se := corner_h(wx + 1, wz + 1)
+	h_sw := corner_h(wx, wz + 1)
+	fh := floor_h(wx, wz)
+
+	// Floor.
+	if stair_at(wx, wz) {
+		emit_stair(v, wx, wz, fh, pal.floor, k)
+	} else if hole_at(wx, wz) {
+		emit_hole(v, wx, wz, fh)
+	} else if pool_at(wx, wz) {
+		water_col := rl.Color{50, 160, 190, 255}
+		flat_lit(v, {x0, fh, z0}, {x1, fh, z0}, {x1, fh, z1}, {x0, fh, z1}, water_col)
+	} else {
+		flat_lit(v, {x0, fh, z0}, {x1, fh, z0}, {x1, fh, z1}, {x0, fh, z1}, shade(pal.floor, k))
+	}
+
+	// Ceiling.
+	flat_lit(v, {x0, h_nw, z0}, {x1, h_ne, z0}, {x1, h_se, z1}, {x0, h_sw, z1}, shade(pal.ceil, k))
+
+	emit_decals(v, wx, wz, biome, fh)
+
+	// Light fixture.
+	if pw := light_power(wx, wz); pw > 0 {
+		lx0, lz0 := x0 + CELL * 0.25, z0 + CELL * 0.25
+		lx1, lz1 := x0 + CELL * 0.75, z0 + CELL * 0.75
+		y00 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.25, 0.25) - 0.02
+		y10 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.75, 0.25) - 0.02
+		y11 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.75, 0.75) - 0.02
+		y01 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.25, 0.75) - 0.02
+		base_lcol := light_color(wx, wz)
+		quad(v, {lx0, y00, lz0}, {lx1, y10, lz0}, {lx1, y11, lz1}, {lx0, y01, lz1}, base_lcol)
+	}
+
+	// Pillar.
+	if pillar_at(wx, wz) {
+		i :: CELL * 0.3
+		ph := max(h_nw, h_ne, h_se, h_sw) + 0.05
+		wall_box(v, {x0 + i, z0 + i}, {x1 - i, z1 - i}, pal.wall, fh, ph)
+	}
+
+	// West wall.
+	if has_wall(wx, wz, false) {
+		wall_h := west_wall_height(wx, wz)
+		base_w := west_wall_base(wx, wz)
+		start_h: f32 = 0
+		end_h: f32 = 0
+		if has_wall(wx, wz - 1, false) do start_h = west_wall_height(wx, wz - 1)
+		if has_wall(wx, wz + 1, false) do end_h = west_wall_height(wx, wz + 1)
+		emit_wall(v, wx, wz, false, pal.wall, base_w, wall_h, start_h, end_h)
+	}
+
+	// North wall.
+	if has_wall(wx, wz, true) {
+		wall_h := north_wall_height(wx, wz)
+		base_n := north_wall_base(wx, wz)
+		start_h: f32 = 0
+		end_h: f32 = 0
+		if has_wall(wx - 1, wz, true) do start_h = north_wall_height(wx - 1, wz)
+		if has_wall(wx + 1, wz, true) do end_h = north_wall_height(wx + 1, wz)
+		emit_wall(v, wx, wz, true, pal.wall, base_n, wall_h, start_h, end_h)
+	}
+
+	// Floor step risers.
+	emit_step_w(v, wx, wz)
+	emit_step_n(v, wx, wz)
+}
+
+// Compatibility helper for tools that still request a fully built mesh directly.
+// Normal gameplay should use world_update's time-sliced Chunk_Builder instead.
 build_chunk :: proc(c: Chunk_Coord) -> rl.Mesh {
-	v: Verts
-	defer {delete(v.pos); delete(v.col)}
-	light_grid_fill(c)
+	b: Chunk_Builder
+	chunk_builder_begin(&b, c)
 
-	for z in 0 ..< i32(CHUNK_SIZE) do for x in 0 ..< i32(CHUNK_SIZE) {
-		wx, wz := c.x * CHUNK_SIZE + x, c.y * CHUNK_SIZE + z
-		x0, z0 := f32(wx) * CELL, f32(wz) * CELL
-		x1, z1 := x0 + CELL, z0 + CELL
-		light_center = {x0 + CELL * 0.5, z0 + CELL * 0.5}
-
-		biome := biome_at(wx, wz)
-		pal := PALETTES[biome]
-		k := i32((raw_hash(wx, wz) >> 4) % 3) * 8 - 8
-
-		h_nw := corner_h(wx, wz)
-		h_ne := corner_h(wx + 1, wz)
-		h_se := corner_h(wx + 1, wz + 1)
-		h_sw := corner_h(wx, wz + 1)
-		fh := floor_h(wx, wz)
-
-		// ── floor: stair / hole / pool / flat ──
-		if stair_at(wx, wz) {
-			emit_stair(&v, wx, wz, fh, pal.floor, k)
-		} else if hole_at(wx, wz) {
-			emit_hole(&v, wx, wz, fh)
-		} else if pool_at(wx, wz) {
-			water_col := rl.Color{50, 160, 190, 255}
-			flat_lit(&v, {x0, fh, z0}, {x1, fh, z0}, {x1, fh, z1}, {x0, fh, z1}, water_col)
-		} else {
-			flat_lit(&v, {x0, fh, z0}, {x1, fh, z0}, {x1, fh, z1}, {x0, fh, z1}, shade(pal.floor, k))
-		}
-
-		// ── ceiling ──
-		flat_lit(&v, {x0, h_nw, z0}, {x1, h_ne, z0}, {x1, h_se, z1}, {x0, h_sw, z1}, shade(pal.ceil, k))
-
-		emit_decals(&v, wx, wz, biome, fh)
-
-		// ── light ──
-		if pw := light_power(wx, wz); pw > 0 {
-			lx0, lz0 := x0 + CELL * 0.25, z0 + CELL * 0.25
-			lx1, lz1 := x0 + CELL * 0.75, z0 + CELL * 0.75
-			y00 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.25, 0.25) - 0.02
-			y10 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.75, 0.25) - 0.02
-			y11 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.75, 0.75) - 0.02
-			y01 := bilerp4(h_nw, h_ne, h_se, h_sw, 0.25, 0.75) - 0.02
-			base_lcol := light_color(wx, wz)
-			quad(&v, {lx0, y00, lz0}, {lx1, y10, lz0}, {lx1, y11, lz1}, {lx0, y01, lz1}, base_lcol)
-		}
-
-		// ── pillar ──
-		if pillar_at(wx, wz) {
-			i :: CELL * 0.3
-			ph := max(h_nw, h_ne, h_se, h_sw) + 0.05
-			wall_box(&v, {x0 + i, z0 + i}, {x1 - i, z1 - i}, pal.wall, fh, ph)
-		}
-
-		// ── walls ──
-		if has_wall(wx, wz, false) {
-			wall_h := west_wall_height(wx, wz)
-			base_w := west_wall_base(wx, wz)
-			start_h: f32 = 0; end_h: f32 = 0
-			if has_wall(wx, wz - 1, false) do start_h = west_wall_height(wx, wz - 1)
-			if has_wall(wx, wz + 1, false) do end_h = west_wall_height(wx, wz + 1)
-			emit_wall(&v, wx, wz, false, pal.wall, base_w, wall_h, start_h, end_h)
-		}
-		if has_wall(wx, wz, true) {
-			wall_h := north_wall_height(wx, wz)
-			base_n := north_wall_base(wx, wz)
-			start_h: f32 = 0; end_h: f32 = 0
-			if has_wall(wx - 1, wz, true) do start_h = north_wall_height(wx - 1, wz)
-			if has_wall(wx + 1, wz, true) do end_h = north_wall_height(wx + 1, wz)
-			emit_wall(&v, wx, wz, true, pal.wall, base_n, wall_h, start_h, end_h)
-		}
-
-		// ── floor step risers ──
-		emit_step_w(&v, wx, wz)
-		emit_step_n(&v, wx, wz)
+	for b.stage != .Upload {
+		chunk_builder_step(&b)
 	}
 
-	n := len(v.col) / 4
-	m := rl.Mesh {
-		vertexCount   = i32(n),
-		triangleCount = i32(n / 3),
-	}
-	m.vertices = cast([^]f32)rl.MemAlloc(u32(len(v.pos) * size_of(f32)))
-	m.colors = cast([^]u8)rl.MemAlloc(u32(len(v.col)))
-	copy(m.vertices[:len(v.pos)], v.pos[:])
-	copy(m.colors[:len(v.col)], v.col[:])
-	rl.UploadMesh(&m, false)
+	m := chunk_builder_upload(&b)
+	chunk_builder_cancel(&b)
 	return m
 }
