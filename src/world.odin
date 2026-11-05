@@ -163,6 +163,31 @@ world_init :: proc(shader: rl.Shader) -> World {
 	return w
 }
 
+// Build the complete initial view before gameplay starts. This intentionally
+// moves the initial generation cost to startup so the player never sees a
+// partially populated spawn area. Subsequent movement still streams chunks.
+world_preload :: proc(w: ^World, pos: rl.Vector3) {
+	pc := Chunk_Coord{
+		i32(math.floor(pos.x / CHUNK_W)),
+		i32(math.floor(pos.z / CHUNK_W)),
+	}
+
+	// Cancel any pending incremental job before synchronous preloading.
+	chunk_builder_cancel(&w.builder)
+
+	for radius in 0 ..= VIEW_RADIUS {
+		for dz in -radius ..= radius {
+			for dx in -radius ..= radius {
+				// Build concentric square rings, nearest chunks first.
+				if radius > 0 && max(abs(dx), abs(dz)) != radius do continue
+				c := pc + {i32(dx), i32(dz)}
+				if c in w.chunks do continue
+				w.chunks[c] = build_chunk(c)
+			}
+		}
+	}
+}
+
 chunk_builder_cancel :: proc(b: ^Chunk_Builder) {
 	delete(b.verts.pos)
 	delete(b.verts.col)

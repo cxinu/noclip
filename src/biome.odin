@@ -71,6 +71,12 @@ LEVELS := [NUM_LEVELS]Level_Def {
 current_level: i32
 level_dirty: bool
 
+// Exit cells on the final level. Regions are generated lazily, so the list
+// grows as the player explores; it is reset on every level transition.
+EXIT_CELLS_MAX :: 128
+exit_cells: [EXIT_CELLS_MAX][2]i32
+exit_cell_count: i32 = 0
+
 level_seed :: proc() -> u32 {return WORLD_SEED + u32(current_level) * 2246822519}
 
 set_level :: proc(l: i32) {
@@ -78,7 +84,11 @@ set_level :: proc(l: i32) {
 	if nl == current_level do return
 	current_level = nl
 	last_region = nil
+	exit_cell_count = 0
 	level_dirty = true
+	// The device cannot follow you through a floor transition; it reappears in
+	// your pocket on the next floor instead of becoming a ghost item.
+	reset_walkie(true)
 }
 
 Chunk_Coord :: [2]i32
@@ -284,6 +294,8 @@ CELL_POOL :: 2
 // NEW: transition flags
 CELL_STAIR :: 4
 CELL_HOLE :: 8
+// NEW: exit door on final level
+CELL_EXIT :: 16
 
 SPAWN_CLEAR :: 2
 
@@ -701,6 +713,8 @@ generate_region :: proc(r: ^Region, ri, rj: i32) {
 	// NEW: vertical connectivity
 	if stair_site(ri, rj) do place_stairwell(r, ri, rj)
 	if hole_site(ri, rj) do place_hole(r, ri, rj)
+	// Exit door on final level
+	place_exit(r, ri, rj)
 }
 
 // ───────────────────────── queries ─────────────────────────
@@ -739,6 +753,73 @@ hole_at :: proc(wx, wz: i32) -> bool {
 stair_dir_at :: proc(wx, wz: i32) -> u8 {
 	r := region_at(wx, wz)
 	return r.cell_stair[region_idx(r, wx, wz)]
+}
+
+exit_at :: proc(wx, wz: i32) -> bool {
+	if abs(wx) <= SPAWN_CLEAR && abs(wz) <= SPAWN_CLEAR do return false
+	r := region_at(wx, wz)
+	return (r.cell_flg[region_idx(r, wx, wz)] & CELL_EXIT) != 0
+}
+
+// Find a safe cell for key placement: not hole/stair/pillar/exit. Prefers a
+// cell under a ceiling light 6-20 cells from the player, so the key sits in an
+// obvious lit pocket and picking it up means walking away from safety. Falls
+// back to the farthest safe cell if the level has no usable lit pocket.
+find_key_cell :: proc(cx, cz: i32) -> (i32, i32) {
+	lit_x, lit_z := cx, cz
+	lit_dist: i32 = -1
+	any_x, any_z := cx, cz
+	any_dist: i32 = -1
+
+	radius :: 20
+	min_lit :: 36 // 6 cells
+	min_any :: 16 // 4 cells
+	max_dist :: radius * radius
+
+	for z in cz - radius ..= cz + radius do for x in cx - radius ..= cx + radius {
+		if hole_at(x, z) || stair_at(x, z) || pillar_at(x, z) || exit_at(x, z) do continue
+		dx := x - cx
+		dz := z - cz
+		dist := dx * dx + dz * dz
+		if dist > max_dist do continue
+
+		if dist >= min_any && dist > any_dist {
+			any_dist = dist
+			any_x = x
+			any_z = z
+		}
+		if dist >= min_lit && dist > lit_dist && light_power(x, z) > 0 {
+			lit_dist = dist
+			lit_x = x
+			lit_z = z
+		}
+	}
+
+	if lit_dist >= 0 do return lit_x, lit_z
+	return any_x, any_z
+}
+
+// Place the exit door on the final level (NUM_LEVELS - 1).
+place_exit :: proc(r: ^Region, ri, rj: i32) {
+	if current_level != NUM_LEVELS - 1 do return
+	// Place exit near center of region, away from spawn
+	cx_rel := i32(4 + raw_hash(ri, rj + 7) % 8)
+	cz_rel := i32(4 + raw_hash(ri + 5, rj) % 8)
+	sx := r.x0 + cx_rel
+	sz := r.z0 + cz_rel
+	if sx >= r.x0 + r.w - 2 || sz >= r.z0 + r.h - 2 do return
+	if abs(sx) <= SPAWN_CLEAR + 4 && abs(sz) <= SPAWN_CLEAR + 4 do return
+
+	clear_walls_3x3(r, sx, sz)
+	i := region_idx(r, sx, sz)
+	r.cell_flg[i] &= ~u8(CELL_PILLAR | CELL_POOL | CELL_STAIR | CELL_HOLE)
+	r.cell_flg[i] |= CELL_EXIT
+	r.cell_floor[i] = 0
+
+	if exit_cell_count < EXIT_CELLS_MAX {
+		exit_cells[exit_cell_count] = {sx, sz}
+		exit_cell_count += 1
+	}
 }
 
 floor_level :: proc(x, z: i32) -> i8 {
@@ -810,6 +891,17 @@ light_power :: proc(x, z: i32) -> f32 {
 	if r < 20 do return 0
 	if r < 70 do return 0.5
 	return 1
+}
+
+// True if a ceiling light exists in or directly around the given cell.
+// Used to decide whether the player is standing in a "safe" lit pocket.
+in_light :: proc(cx, cz: i32) -> bool {
+	for dz in -1 ..= 1 do for dx in -1 ..= 1 {
+		ix: i32 = i32(dx)
+		iz: i32 = i32(dz)
+		if light_power(cx + ix, cz + iz) > 0 do return true
+	}
+	return false
 }
 
 light_color :: proc(x, z: i32) -> rl.Color {

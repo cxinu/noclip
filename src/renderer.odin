@@ -95,7 +95,8 @@ renderer_destroy :: proc(r: ^Renderer) {
 
 // fade: 0.0 = fully visible, 1.0 = fully black. Drawn on top of everything so
 // level transitions are hidden without the shader chain quantizing the fade.
-renderer_present :: proc(r: ^Renderer, fade: f32 = 0) {
+// If p is non-nil, the gameplay HUD is drawn in the same frame.
+renderer_present :: proc(r: ^Renderer, fade: f32 = 0, p: ^Player = nil) {
 	rl.BeginDrawing()
 	rl.ClearBackground(rl.BLACK)
 
@@ -131,6 +132,11 @@ renderer_present :: proc(r: ^Renderer, fade: f32 = 0) {
 	if fade > 0 {
 		a := u8(clamp(fade, 0, 1) * 255 + 0.5)
 		rl.DrawRectangle(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), {0, 0, 0, a})
+	}
+
+	// 4. HUD (only during gameplay, hidden while the transition fades out).
+	if p != nil && fade < 0.85 {
+		draw_hud(p)
 	}
 
 	rl.EndDrawing()

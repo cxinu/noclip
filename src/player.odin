@@ -3,6 +3,8 @@ package main
 import "core:math"
 import rl "vendor:raylib"
 
+KB_LOOK_SPEED :: 1.8 // radians per second for arrow-key look fallback
+
 Player :: struct {
 	cam:                              rl.Camera3D,
 	yaw, pitch, feet_y, eye_y, vel_y: f32,
@@ -16,6 +18,7 @@ Player :: struct {
 	pending_cx, pending_cz:           i32,
 	fade:                             f32, // 0=transparent, 1=black
 	grace:                            f32, // seconds until next transition allowed
+	hiding:                           bool,
 }
 
 player_init :: proc() -> Player {
@@ -62,11 +65,40 @@ safe_landing :: proc(cx, cz: i32) -> (i32, i32) {
 }
 
 player_update :: proc(p: ^Player, dt: f32) {
+	// ── input ──
+	if rl.IsKeyPressed(.F) {
+		toggle_flashlight()
+	}
+	if rl.IsKeyPressed(.E) && !has_key {
+		// Pick up key if nearby
+		dx := key_item.pos[0] - p.cam.position.x
+		dz := key_item.pos[2] - p.cam.position.z
+		dy := key_item.pos[1] - p.cam.position.y
+		if math.sqrt(dx * dx + dz * dz) < 2.0 && abs(dy) < 2.2 && key_item.active {
+			key_item.active = false
+			has_key = true
+			sanity_heal(15.0)
+		}
+	}
+
 	// ── look ──
 	md := rl.GetMouseDelta()
 	if p.warmup > 0 {p.warmup -= 1; md = {}}
-	p.yaw -= clamp(md.x, -150, 150) * MOUSE_SENS
-	p.pitch = clamp(p.pitch - clamp(md.y, -150, 150) * MOUSE_SENS, -1.4, 1.4)
+
+	// Keyboard look fallback for systems where the window manager refuses to
+	// capture the cursor. Arrow keys always work.
+	kb_x, kb_y: f32
+	if rl.IsKeyDown(.LEFT) do kb_x -= 1
+	if rl.IsKeyDown(.RIGHT) do kb_x += 1
+	if rl.IsKeyDown(.UP) do kb_y -= 1
+	if rl.IsKeyDown(.DOWN) do kb_y += 1
+
+	p.yaw -= clamp(md.x, -150, 150) * MOUSE_SENS + kb_x * KB_LOOK_SPEED * dt
+	p.pitch = clamp(
+		p.pitch - (clamp(md.y, -150, 150) * MOUSE_SENS + kb_y * KB_LOOK_SPEED * dt),
+		-1.4,
+		1.4,
+	)
 
 	sy, cy := math.sin(p.yaw), math.cos(p.yaw)
 	fwd := rl.Vector3{sy, 0, cy}
@@ -80,8 +112,12 @@ player_update :: proc(p: ^Player, dt: f32) {
 	if rl.IsKeyDown(.A) do dir -= right
 	if l := math.sqrt(dir.x * dir.x + dir.z * dir.z); l > 0 do dir /= l
 
-	sprint := rl.IsKeyDown(.LEFT_SHIFT) && rl.IsKeyDown(.W)
+	// Phase 1.4: hold Ctrl to crouch/hide. Slow, but entities lose you in the
+	// dark and it lowers the camera.
+	p.hiding = rl.IsKeyDown(.LEFT_CONTROL)
+	sprint := rl.IsKeyDown(.LEFT_SHIFT) && rl.IsKeyDown(.W) && !p.hiding
 	speed := f32(MOVE_SPEED) * (sprint ? 1.7 : 1.0)
+	if p.hiding do speed *= 0.45
 	old_pos := p.cam.position
 
 	proposed := rl.Vector2 {
@@ -235,7 +271,7 @@ player_update :: proc(p: ^Player, dt: f32) {
 	pitch := clamp(p.pitch + p.kick[1] + wobble(t * 0.8, 7) * 0.002 * d, -1.45, 1.45)
 	roll += wobble(t * 0.7, 13) * 0.003 * d
 
-	p.eye_y += (p.feet_y + EYE_H - p.eye_y) * min(1.0, 18 * dt)
+	p.eye_y += ((p.feet_y + (p.hiding ? EYE_H * 0.55 : EYE_H)) - p.eye_y) * min(1.0, 18 * dt)
 	p.cam.position.y = p.eye_y + stride + p.kick[0]
 	p.cam.target =
 		p.cam.position +
